@@ -14,6 +14,7 @@ from pynput import keyboard
 import config
 from enum import Enum
 from typing import Tuple, Optional
+import signal
 
 class X11Backend(Enum):
     XLIB = "xlib"           # Direct python3-xlib (fastest)
@@ -111,7 +112,7 @@ class X11MouseController:
         print(f"  Ctrl + Movement: Larger steps ({self.ctrl_leap_distance}px per press)")
         print("  U: Scroll up; M/N: Scroll down")
         print("  Super+J: Toggle mouse mode on/off; X: Exit mouse mode")
-        print("  ESC: Exit app")
+        print("  Ctrl+Q: Exit app")
         print("  H/Space: Left click (hold Space to drag/select); ;: Right click")
         smooth_status = "ON" if self.smooth_movement else "OFF"
         print(f"\nSmooth movement: {smooth_status}")
@@ -942,9 +943,8 @@ class X11MouseController:
         """Handle key press events"""
         try:
             if key == keyboard.Key.esc:
-                print("\nExiting...")
-                self.running = False
-                return False
+                # Ignore ESC to avoid accidental app exit (e.g., GNOME overview sends ESC)
+                return None
             
             elif key == keyboard.Key.space and self.mouse_mode:
                 # Space acts as left click/hold
@@ -973,6 +973,11 @@ class X11MouseController:
             elif hasattr(key, 'char') and key.char:
                 raw_char = key.char
                 char = raw_char.lower()
+                # New explicit exit shortcut
+                if char == 'q' and self.ctrl_pressed:
+                    print("\nExiting...")
+                    self.running = False
+                    return False
                 if char == 'j' and self.super_pressed:
                     # When X11 grabs are active, toggles are handled in X11 loop
                     if not self.key_grab_active:
@@ -1230,6 +1235,11 @@ class X11MouseController:
 
 def main():
     """Main entry point with backend selection"""
+    # Ignore SIGINT so Ctrl+C (e.g., copy) doesn't stop the app
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except Exception:
+        pass
     # Default backend from config
     default_backend_name = getattr(config, 'DEFAULT_BACKEND', 'xlib').lower()
     backend_map = {
