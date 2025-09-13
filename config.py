@@ -21,7 +21,8 @@ MOVE_SPEED = 3
 # Diagonal acceleration multiplier (applied when moving both x and y)
 ACCELERATION = 1.5
 
-# Time between movement updates (seconds). Lower = faster cursor (more ticks/sec)
+# Time between 
+#movement updates (seconds). Lower = faster cursor (more ticks/sec)
 MOVEMENT_INTERVAL = 0.004  # 250 Hz
 
 # Per-tick jump size when Ctrl is held
