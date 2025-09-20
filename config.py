@@ -16,7 +16,7 @@ Notes:
 DEFAULT_BACKEND = "xlib"
 
 # Base step size in pixels per movement tick (per axis)
-MOVE_SPEED = 3
+MOVE_SPEED = 2
 
 # Diagonal acceleration multiplier (applied when moving both x and y)
 ACCELERATION = 1.5
@@ -26,7 +26,7 @@ ACCELERATION = 1.5
 MOVEMENT_INTERVAL = 0.004  # 250 Hz
 
 # Per-tick jump size when Ctrl is held
-CTRL_LEAP_DISTANCE = 20
+CTRL_LEAP_DISTANCE = 10
 
 # Smooth movement interpolates frames between ticks for visual smoothness
 SMOOTH_MOVEMENT = True
