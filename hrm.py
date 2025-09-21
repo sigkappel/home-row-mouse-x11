@@ -10,6 +10,7 @@ import subprocess
 import os
 import threading
 import gc
+from contextlib import nullcontext
 from pynput import keyboard
 import config
 from enum import Enum
@@ -34,14 +35,14 @@ class X11MouseController:
         self.backend = backend
         self.move_speed = move_speed if move_speed is not None else int(getattr(config, 'MOVE_SPEED', 5))
         self.acceleration = acceleration if acceleration is not None else float(getattr(config, 'ACCELERATION', 1.5))
+        self.display_lock = threading.RLock()
         self.current_speed = self.move_speed
         self.running = True
         self.mouse_mode = False
-        self.pressed_keys = set()
         self.movement_keys = set()  # Track which movement keys are pressed
         self.ctrl_pressed = False
-        self.super_pressed = False
         self.shift_pressed = False
+        self.alt_pressed = False
         self.ctrl_leap_distance = int(getattr(config, 'CTRL_LEAP_DISTANCE', 50))  # Ctrl modifier distance
         self.last_cursor_refresh = 0  # Track last cursor refresh time
         self.space_click_active = False  # Track Space-as-left-button state
@@ -51,6 +52,7 @@ class X11MouseController:
         self.key_grab_active = False
         self.x11_event_thread = None
         self.x11_events_active = False
+        self.listener = None
 
         # Continuous movement settings
         self.movement_thread = None
@@ -108,15 +110,53 @@ class X11MouseController:
         
         print(f"X11 Mouse Controller Started! (Backend: {backend.value})")
         print("Controls:")
-        print(f"  Arrow Keys or I/J/K/L: Move mouse ({self.move_speed}px per press)")
-        print(f"  Ctrl + Movement: Larger steps ({self.ctrl_leap_distance}px per press)")
-        print("  U: Scroll up; M/N: Scroll down")
-        print("  Super+J: Toggle mouse mode on/off; X: Exit mouse mode")
+        print(f"  Hold Alt + Arrow Keys/I/J/K/L: Move mouse ({self.move_speed}px per press)")
+        print(f"  Hold Alt + Ctrl: Larger steps ({self.ctrl_leap_distance}px per press)")
+        print("  Hold Alt + U: Scroll up; Alt + M/N: Scroll down")
         print("  Ctrl+Q: Exit app")
-        print("  H/Space: Left click (hold Space to drag/select); ;: Right click")
+        print("  Hold Alt + H/Space: Left click (Space holds for drag); Alt + ;: Right click")
         smooth_status = "ON" if self.smooth_movement else "OFF"
         print(f"\nSmooth movement: {smooth_status}")
-        print(f"Mouse mode: OFF - Press Super+J to toggle...")
+        print("Mouse mode: Press and hold Alt to control the cursor")
+
+        if self.backend == X11Backend.XLIB:
+            self._grab_alt_keys_only()
+
+    def _display_guard(self):
+        """Return an appropriate context manager for Display access."""
+        if self.backend != X11Backend.XLIB or self.display_lock is None:
+            return nullcontext()
+        return self.display_lock
+
+    def _grab_alt_keys_only(self):
+        """Ensure Alt toggles mouse mode without breaking desktop shortcuts."""
+        if self.backend != X11Backend.XLIB:
+            return
+
+        # Previous revisions grabbed Alt globally, which blocked Alt+Tab and other
+        # window manager shortcuts. We now rely on the pynput listener for Alt
+        # detection, so make sure no stale grabs remain.
+        with self._display_guard():
+            try:
+                from Xlib import X
+                import Xlib.XK
+
+                self._push_ignore_badaccess()
+                try:
+                    for keysym in (Xlib.XK.XK_Alt_L, Xlib.XK.XK_Alt_R):
+                        keycode = self.display.keysym_to_keycode(keysym)
+                        if not keycode:
+                            continue
+                        try:
+                            # Release any passive grabs from earlier runs.
+                            self.root.ungrab_key(keycode, X.AnyModifier)
+                        except:
+                            pass
+                finally:
+                    self._pop_error_handler()
+            except Exception as e:
+                if self.debug:
+                    print(f"Alt ungrab check failed: {e}")
 
     def _init_backend(self):
         """Initialize the selected X11 backend"""
@@ -251,54 +291,94 @@ class X11MouseController:
         except:
             pass
 
-    def _toggle_mouse_mode(self):
-        """Toggle mouse mode and (un)grab keys accordingly"""
-        self.mouse_mode = not self.mouse_mode
-        self.pressed_keys.clear()
+    def _set_mouse_mode(self, enabled: bool):
+        """Enable or disable mouse mode depending on Alt state."""
+        enabled = bool(enabled)
+        if self.mouse_mode == enabled:
+            return
 
+        self.mouse_mode = enabled
         if self.mouse_mode:
             self._grab_navigation_keys()
+            self._sync_cached_position_from_os()
+            print("\nMouse mode: ON (Alt held)")
         else:
-            self._ungrab_navigation_keys()
-
-        status = "ON" if self.mouse_mode else "OFF"
-        print(f"\nMouse mode: {status}")
+            self.movement_keys.clear()
+            self.scroll_keys.clear()
+            self._stop_continuous_movement()
+            if self.space_click_active:
+                self.release_mouse(1)
+                self.space_click_active = False
+            self._ungrab_navigation_keys_only()
+            print("\nMouse mode: OFF")
 
     def _push_ignore_badaccess(self):
         """Temporarily ignore BadAccess X errors (used during grab/ungrab)."""
-        try:
-            from Xlib import error as xerror
-            # Save old handler if available
+        if self.backend != X11Backend.XLIB:
+            return
+        with self._display_guard():
             try:
-                self._old_x_error_handler = self.display.get_error_handler()
-            except:
-                self._old_x_error_handler = None
+                from Xlib import error as xerror
+                # Save old handler if available
+                try:
+                    self._old_x_error_handler = self.display.get_error_handler()
+                except:
+                    self._old_x_error_handler = None
 
-            def _handler(err, *args, **kwargs):
-                # Silently ignore BadAccess errors
-                if isinstance(err, xerror.BadAccess):
-                    return None
-                # Fallback to previous handler if it exists
-                if self._old_x_error_handler:
-                    try:
-                        return self._old_x_error_handler(err, *args, **kwargs)
-                    except:
+                def _handler(err, *args, **kwargs):
+                    # Silently ignore BadAccess errors
+                    if isinstance(err, xerror.BadAccess):
                         return None
-                # Otherwise, swallow
-                return None
+                    # Fallback to previous handler if it exists
+                    if self._old_x_error_handler:
+                        try:
+                            return self._old_x_error_handler(err, *args, **kwargs)
+                        except:
+                            return None
+                    # Otherwise, swallow
+                    return None
 
-            self.display.set_error_handler(_handler)
-        except:
-            pass
+                self.display.set_error_handler(_handler)
+            except:
+                pass
 
     def _pop_error_handler(self):
         """Restore previous X error handler if we changed it."""
-        try:
-            if hasattr(self, '_old_x_error_handler'):
-                self.display.set_error_handler(self._old_x_error_handler)
-                self._old_x_error_handler = None
-        except:
-            pass
+        if self.backend != X11Backend.XLIB:
+            return
+        with self._display_guard():
+            try:
+                if hasattr(self, '_old_x_error_handler'):
+                    self.display.set_error_handler(self._old_x_error_handler)
+                    self._old_x_error_handler = None
+            except:
+                pass
+
+    def _suppress_current_event(self):
+        """Best-effort suppression for the keyboard event currently being handled."""
+        if self.listener and hasattr(self.listener, 'suppress_event'):
+            try:
+                self.listener.suppress_event()
+            except AttributeError:
+                pass
+
+    def _release_movement_key(self, key_equivalent) -> bool:
+        """Centralised helper to stop movement tied to a specific key."""
+        removed = False
+        if key_equivalent in self.movement_keys:
+            self.movement_keys.discard(key_equivalent)
+            removed = True
+        if removed and not self.movement_keys and not self.scroll_keys:
+            self._stop_continuous_movement()
+        return removed
+
+    def _release_scroll_key(self, direction: str) -> bool:
+        removed = direction in self.scroll_keys
+        if removed:
+            self.scroll_keys.discard(direction)
+            if not self.movement_keys and not self.scroll_keys:
+                self._stop_continuous_movement()
+        return removed
 
     def _grab_navigation_keys(self):
         """Grab navigation keys to prevent them from reaching other applications"""
@@ -308,138 +388,168 @@ class X11MouseController:
         if self.key_grab_active:
             return  # Already grabbed
 
-        try:
-            from Xlib import X
-            import Xlib.XK
-
-            # Define keys to grab with their keysyms
-            navigation_keys = {
-                # Arrow keys
-                'Up': Xlib.XK.XK_Up,
-                'Down': Xlib.XK.XK_Down,
-                'Left': Xlib.XK.XK_Left,
-                'Right': Xlib.XK.XK_Right,
-                # IJKL keys
-                'i': Xlib.XK.XK_i,
-                'j': Xlib.XK.XK_j,
-                'k': Xlib.XK.XK_k,
-                'l': Xlib.XK.XK_l,
-                # Scroll keys
-                'u': Xlib.XK.XK_u,
-                'm': Xlib.XK.XK_m,
-                'n': Xlib.XK.XK_n,
-                # Exit key
-                'x': Xlib.XK.XK_x,
-                # Click keys
-                'h': Xlib.XK.XK_h,
-                'semicolon': Xlib.XK.XK_semicolon,
-                'space': Xlib.XK.XK_space
-            }
-
-            # Build comprehensive modifier combinations to account for CapsLock/NumLock/Super states
-            base_mods = [
-                0,
-                X.ControlMask,
-                X.ShiftMask,
-                X.Mod1Mask,  # Alt
-                X.ControlMask | X.ShiftMask,
-                X.ControlMask | X.Mod1Mask,
-                X.ShiftMask | X.Mod1Mask,
-                X.ControlMask | X.ShiftMask | X.Mod1Mask,
-            ]
-
-            caps_variants = [0, X.LockMask]         # CapsLock
-            numlock_variants = [0, X.Mod2Mask]      # NumLock
-            super_variants = [0, X.Mod4Mask]        # Super/Windows
-
-            all_modifier_combinations = set()
-            for base in base_mods:
-                for caps in caps_variants:
-                    for numl in numlock_variants:
-                        for sup in super_variants:
-                            all_modifier_combinations.add(base | caps | numl | sup)
-
-            # Suppress BadAccess errors during grabs (some combos may already be grabbed)
-            self._push_ignore_badaccess()
+        with self._display_guard():
             try:
-                for key_name, keysym in navigation_keys.items():
-                    try:
-                        keycode = self.display.keysym_to_keycode(keysym)
-                        if keycode != 0:
-                            for modifiers in all_modifier_combinations:
-                                try:
-                                    self.root.grab_key(keycode, modifiers, False, X.GrabModeAsync, X.GrabModeAsync)
-                                    self.grabbed_keys.add((keycode, modifiers))
-                                except:
-                                    pass
-                    except:
-                        continue
-                self.display.sync()
-            finally:
-                self._pop_error_handler()
+                from Xlib import X
+                import Xlib.XK
 
-            self.key_grab_active = True
+                # Define keys to grab with their keysyms
+                navigation_keys = {
+                    # Arrow keys
+                    'Up': Xlib.XK.XK_Up,
+                    'Down': Xlib.XK.XK_Down,
+                    'Left': Xlib.XK.XK_Left,
+                    'Right': Xlib.XK.XK_Right,
+                    # IJKL keys
+                    'i': Xlib.XK.XK_i,
+                    'j': Xlib.XK.XK_j,
+                    'k': Xlib.XK.XK_k,
+                    'l': Xlib.XK.XK_l,
+                    # Scroll keys
+                    'u': Xlib.XK.XK_u,
+                    'm': Xlib.XK.XK_m,
+                    'n': Xlib.XK.XK_n,
+                    # Exit key
+                    'x': Xlib.XK.XK_x,
+                    # Click keys
+                    'h': Xlib.XK.XK_h,
+                    'semicolon': Xlib.XK.XK_semicolon,
+                    'space': Xlib.XK.XK_space
+                }
 
-            # Start X11 event handling thread for grabbed keys
-            self._start_x11_event_handling()
+                # Build comprehensive modifier combinations to account for CapsLock/NumLock/Super states
+                base_mods = [
+                    0,
+                    X.ControlMask,
+                    X.ShiftMask,
+                    X.Mod1Mask,  # Alt
+                    X.ControlMask | X.ShiftMask,
+                    X.ControlMask | X.Mod1Mask,
+                    X.ShiftMask | X.Mod1Mask,
+                    X.ControlMask | X.ShiftMask | X.Mod1Mask,
+                ]
 
-            print(f"✓ Grabbed navigation keys for suppression (grabbed {len(self.grabbed_keys)} key combinations)")
-        except Exception as e:
-            print(f"✗ Could not grab keys: {e}")
+                caps_variants = [0, X.LockMask]         # CapsLock
+                numlock_variants = [0, X.Mod2Mask]      # NumLock
+                super_variants = [0, X.Mod4Mask]        # Super/Windows
+
+                all_modifier_combinations = set()
+                for base in base_mods:
+                    for caps in caps_variants:
+                        for numl in numlock_variants:
+                            for sup in super_variants:
+                                all_modifier_combinations.add(base | caps | numl | sup)
+
+                # Suppress BadAccess errors during grabs (some combos may already be grabbed)
+                self._push_ignore_badaccess()
+                try:
+                    for key_name, keysym in navigation_keys.items():
+                        try:
+                            keycode = self.display.keysym_to_keycode(keysym)
+                            if keycode != 0:
+                                for modifiers in all_modifier_combinations:
+                                    try:
+                                        self.root.grab_key(keycode, modifiers, False, X.GrabModeAsync, X.GrabModeAsync)
+                                        self.grabbed_keys.add((keycode, modifiers))
+                                    except:
+                                        pass
+                        except:
+                            continue
+                    self.display.sync()
+                finally:
+                    self._pop_error_handler()
+
+                self.key_grab_active = True
+
+                # Start X11 event handling thread for grabbed keys
+                self._start_x11_event_handling()
+
+                print(f"✓ Grabbed navigation keys for suppression (grabbed {len(self.grabbed_keys)} key combinations)")
+            except Exception as e:
+                print(f"✗ Could not grab keys: {e}")
+
+    def _ungrab_navigation_keys_only(self):
+        """Release grabbed navigation keys while leaving global shortcuts alone."""
+        if self.backend != X11Backend.XLIB:
+            return
+
+        with self._display_guard():
+            try:
+                import Xlib.XK
+
+                # Identify Alt key keycodes so we keep their grabs
+                alt_keycodes = set()
+                for keysym in (Xlib.XK.XK_Alt_L, Xlib.XK.XK_Alt_R):
+                    keycode = self.display.keysym_to_keycode(keysym)
+                    if keycode != 0:
+                        alt_keycodes.add(keycode)
+
+                keys_to_remove = []
+
+                self._push_ignore_badaccess()
+                try:
+                    for keycode, modifiers in self.grabbed_keys:
+                        if keycode not in alt_keycodes:
+                            try:
+                                self.root.ungrab_key(keycode, modifiers)
+                                keys_to_remove.append((keycode, modifiers))
+                            except:
+                                pass
+
+                    for combo in keys_to_remove:
+                        self.grabbed_keys.discard(combo)
+
+                    self.display.sync()
+                finally:
+                    self._pop_error_handler()
+
+                self.key_grab_active = False
+                if keys_to_remove:
+                    print("✓ Released navigation key grabs")
+            except:
+                pass
 
     def _ungrab_navigation_keys(self):
         """Release grabbed navigation keys"""
-        if self.backend != X11Backend.XLIB or not self.key_grab_active:
+        if self.backend != X11Backend.XLIB or not self.grabbed_keys:
             return
 
-        try:
-            # Stop X11 event handling
-            self._stop_x11_event_handling()
-
-            # Ungrab all previously grabbed keys
-            self._push_ignore_badaccess()
+        with self._display_guard():
             try:
-                for keycode, modifiers in self.grabbed_keys:
-                    try:
-                        self.root.ungrab_key(keycode, modifiers)
-                    except:
-                        pass
-                self.display.sync()
-            finally:
-                self._pop_error_handler()
+                # Stop X11 event handling
+                self._stop_x11_event_handling()
 
-            self.grabbed_keys.clear()
-            self.key_grab_active = False
-            print("✓ Released navigation key grabs")
-        except:
-            pass
+                # Ungrab all previously grabbed keys
+                self._push_ignore_badaccess()
+                try:
+                    for keycode, modifiers in self.grabbed_keys:
+                        try:
+                            self.root.ungrab_key(keycode, modifiers)
+                        except:
+                            pass
+                    self.display.sync()
+                finally:
+                    self._pop_error_handler()
 
-    def _regrab_navigation_keys(self):
-        """Reapply navigation key grabs (useful after GNOME overview)."""
-        try:
-            if self.backend != X11Backend.XLIB or not self.mouse_mode:
-                return
-            # Attempt a clean re-grab cycle
-            if self.key_grab_active:
-                self._ungrab_navigation_keys()
-            self._grab_navigation_keys()
-            if self.debug:
-                print("DEBUG: Re-grabbed navigation keys")
-        except:
-            pass
+                self.grabbed_keys.clear()
+                self.key_grab_active = False
+                print("✓ Released navigation key grabs")
+            except:
+                pass
 
     def _start_x11_event_handling(self):
         """Start X11 event handling thread for grabbed keys"""
         if not self.x11_events_active:
             self.x11_events_active = True
             self.x11_event_thread = threading.Thread(target=self._x11_event_loop, daemon=True)
-            try:
-                from Xlib import X
-                # Ensure we receive KeyPress/KeyRelease events on the root window
-                self.root.change_attributes(event_mask=X.KeyPressMask | X.KeyReleaseMask)
-                self.display.sync()
-            except:
-                pass
+            with self._display_guard():
+                try:
+                    from Xlib import X
+                    # Ensure we receive KeyPress/KeyRelease events on the root window
+                    self.root.change_attributes(event_mask=X.KeyPressMask | X.KeyReleaseMask)
+                    self.display.sync()
+                except:
+                    pass
             self.x11_event_thread.start()
             print("✓ Started X11 event handling")
 
@@ -455,21 +565,30 @@ class X11MouseController:
         from Xlib import X
 
         while self.x11_events_active and self.running:
+            event = None
             try:
-                # Check for pending X11 events (non-blocking)
-                if self.display.pending_events() > 0:
-                    event = self.display.next_event()
+                with self._display_guard():
+                    # Check for pending X11 events (non-blocking)
+                    if self.display.pending_events() > 0:
+                        event = self.display.next_event()
+            except Exception as e:
+                if self.debug:
+                    print(f"X11 event loop error: {e}")
+                break
 
+            if event is not None:
+                try:
                     # Handle KeyPress events for grabbed keys
                     if event.type == X.KeyPress:
                         self._handle_grabbed_key_event(event)
                     # Consume KeyRelease events too to prevent them from propagating
                     elif event.type == X.KeyRelease:
                         self._handle_grabbed_key_event(event)
+                except Exception as e:
+                    if self.debug:
+                        print(f"X11 event dispatch error: {e}")
 
-                time.sleep(0.001)  # Small sleep to prevent CPU spinning
-            except:
-                break
+            time.sleep(0.001)  # Small sleep to prevent CPU spinning
 
     def _handle_grabbed_key_event(self, event):
         """Handle grabbed key events and convert them to mouse actions"""
@@ -481,7 +600,8 @@ class X11MouseController:
             keycode = event.detail
 
             # Convert keycode back to keysym to identify the key
-            keysym = self.display.keycode_to_keysym(keycode, 0)
+            with self._display_guard():
+                keysym = self.display.keycode_to_keysym(keycode, 0)
 
             # Debug logging suppressed by default
             if self.debug:
@@ -489,15 +609,22 @@ class X11MouseController:
                 key_name = Xlib.XK.keysym_to_string(keysym) or f"keysym_{keysym}"
                 print(f"DEBUG: Grabbed {event_type} for key: {key_name}")
 
-            # Only handle KeyPress events for actions (ignore KeyRelease)
-            if event.type == X.KeyPress:
-                # Handle Super+J toggle at X11 level to prevent leakage
-                is_super = bool(event.state & X.Mod4Mask)
-                is_shift = bool(event.state & X.ShiftMask)
-                if is_super and keysym == Xlib.XK.XK_j:
-                    self._toggle_mouse_mode()
-                    return
+            if event.type == X.KeyPress and keysym in (Xlib.XK.XK_Alt_L, Xlib.XK.XK_Alt_R):
+                if not self.alt_pressed:
+                    self.alt_pressed = True
+                    self._set_mouse_mode(True)
+                return
 
+            if event.type == X.KeyRelease and keysym in (Xlib.XK.XK_Alt_L, Xlib.XK.XK_Alt_R):
+                if self.alt_pressed:
+                    self.alt_pressed = False
+                    self._set_mouse_mode(False)
+                return
+
+            if not self.mouse_mode:
+                return
+
+            if event.type == X.KeyPress:
                 # Space acts as left-button hold (drag). Tap = click.
                 if keysym == Xlib.XK.XK_space:
                     if not self.space_click_active:
@@ -505,66 +632,53 @@ class X11MouseController:
                         self.press_mouse(1)
                     return
 
-                # X => force exit mouse mode
-                if keysym == Xlib.XK.XK_x:
-                    if self.mouse_mode:
-                        self._toggle_mouse_mode()
-                    return
-
-                # U/M => scroll up/down
+                # Alt+U/M/N => scroll
                 if keysym == Xlib.XK.XK_u:
-                    if self.debug:
-                        print("Scroll up (U)")
-                    self.scroll_vertical(1)
+                    self.scroll_keys.add('up')
+                    self._start_continuous_movement()
                     return
                 if keysym == Xlib.XK.XK_m or keysym == Xlib.XK.XK_n:
-                    if self.debug:
-                        print("Scroll down (M/N)")
-                    self.scroll_vertical(-1)
+                    self.scroll_keys.add('down')
+                    self._start_continuous_movement()
                     return
 
-                # Map keysyms to actions
+                # Map navigation keys to movement directions
                 if keysym == Xlib.XK.XK_Up:
                     self.movement_keys.add(keyboard.Key.up)
                     self._start_continuous_movement()
+                    self._move_single_step(keyboard.Key.up)
                 elif keysym == Xlib.XK.XK_Down:
                     self.movement_keys.add(keyboard.Key.down)
                     self._start_continuous_movement()
+                    self._move_single_step(keyboard.Key.down)
                 elif keysym == Xlib.XK.XK_Left:
                     self.movement_keys.add(keyboard.Key.left)
                     self._start_continuous_movement()
+                    self._move_single_step(keyboard.Key.left)
                 elif keysym == Xlib.XK.XK_Right:
                     self.movement_keys.add(keyboard.Key.right)
                     self._start_continuous_movement()
+                    self._move_single_step(keyboard.Key.right)
                 elif keysym == Xlib.XK.XK_i:
                     self.movement_keys.add(keyboard.Key.up)
                     self._start_continuous_movement()
+                    self._move_single_step(keyboard.Key.up)
                 elif keysym == Xlib.XK.XK_j:
                     self.movement_keys.add(keyboard.Key.left)
                     self._start_continuous_movement()
+                    self._move_single_step(keyboard.Key.left)
                 elif keysym == Xlib.XK.XK_k:
                     self.movement_keys.add(keyboard.Key.down)
                     self._start_continuous_movement()
+                    self._move_single_step(keyboard.Key.down)
                 elif keysym == Xlib.XK.XK_l:
                     self.movement_keys.add(keyboard.Key.right)
                     self._start_continuous_movement()
-                elif keysym == Xlib.XK.XK_u:
-                    self.scroll_keys.add('up')
-                    self._start_continuous_movement()
-                elif keysym == Xlib.XK.XK_m:
-                    self.scroll_keys.add('down')
-                    self._start_continuous_movement()
-                elif keysym == Xlib.XK.XK_n:
-                    self.scroll_keys.add('down')
-                    self._start_continuous_movement()
+                    self._move_single_step(keyboard.Key.right)
                 elif keysym == Xlib.XK.XK_space or keysym == Xlib.XK.XK_h:
-                    self.click_mouse(1)  # Left click
-                    if self.debug:
-                        print("Left click")
+                    self.click_mouse(1)
                 elif keysym == Xlib.XK.XK_semicolon:
-                    self.click_mouse(3)  # Right click
-                    if self.debug:
-                        print("Right click")
+                    self.click_mouse(3)
 
             elif event.type == X.KeyRelease:
                 # Handle key releases to stop movement
@@ -573,32 +687,31 @@ class X11MouseController:
                         self.release_mouse(1)
                         self.space_click_active = False
                     return
-                if keysym == Xlib.XK.XK_Up:
-                    self.movement_keys.discard(keyboard.Key.up)
-                elif keysym == Xlib.XK.XK_Down:
-                    self.movement_keys.discard(keyboard.Key.down)
-                elif keysym == Xlib.XK.XK_Left:
-                    self.movement_keys.discard(keyboard.Key.left)
-                elif keysym == Xlib.XK.XK_Right:
-                    self.movement_keys.discard(keyboard.Key.right)
-                elif keysym == Xlib.XK.XK_i:
-                    self.movement_keys.discard(keyboard.Key.up)
-                elif keysym == Xlib.XK.XK_j:
-                    self.movement_keys.discard(keyboard.Key.left)
-                elif keysym == Xlib.XK.XK_k:
-                    self.movement_keys.discard(keyboard.Key.down)
-                elif keysym == Xlib.XK.XK_l:
-                    self.movement_keys.discard(keyboard.Key.right)
-                elif keysym == Xlib.XK.XK_u:
-                    self.scroll_keys.discard('up')
-                elif keysym == Xlib.XK.XK_m:
-                    self.scroll_keys.discard('down')
-                elif keysym == Xlib.XK.XK_n:
-                    self.scroll_keys.discard('down')
 
-                # Stop movement if no keys are pressed
-                if not self.movement_keys and not self.scroll_keys:
-                    self._stop_continuous_movement()
+                released = False
+                if keysym == Xlib.XK.XK_Up:
+                    released = self._release_movement_key(keyboard.Key.up)
+                elif keysym == Xlib.XK.XK_Down:
+                    released = self._release_movement_key(keyboard.Key.down)
+                elif keysym == Xlib.XK.XK_Left:
+                    released = self._release_movement_key(keyboard.Key.left)
+                elif keysym == Xlib.XK.XK_Right:
+                    released = self._release_movement_key(keyboard.Key.right)
+                elif keysym == Xlib.XK.XK_i:
+                    released = self._release_movement_key(keyboard.Key.up)
+                elif keysym == Xlib.XK.XK_j:
+                    released = self._release_movement_key(keyboard.Key.left)
+                elif keysym == Xlib.XK.XK_k:
+                    released = self._release_movement_key(keyboard.Key.down)
+                elif keysym == Xlib.XK.XK_l:
+                    released = self._release_movement_key(keyboard.Key.right)
+                elif keysym == Xlib.XK.XK_u:
+                    released = self._release_scroll_key('up')
+                elif keysym == Xlib.XK.XK_m or keysym == Xlib.XK.XK_n:
+                    released = self._release_scroll_key('down')
+
+                if released:
+                    return
 
         except Exception as e:
             print(f"Error handling grabbed key: {e}")
@@ -620,21 +733,22 @@ class X11MouseController:
         self.last_wake_time = now
 
         if self.backend == X11Backend.XLIB:
-            try:
-                # Method 1: Force cursor redraw at current position
-                from Xlib.ext.xtest import fake_input
-                from Xlib import X
-                coord = self.root.query_pointer()._data
-                current_x, current_y = coord["root_x"], coord["root_y"]
-                fake_input(self.display, X.MotionNotify, x=current_x, y=current_y, root=self.root)
-                # Prefer flush, only occasional sync
-                self.display.flush()
-                
-                # Method 2: Force cursor visibility through root window
-                self.root.change_attributes(cursor=0)  # Reset cursor
-                self.display.flush()
-            except:
-                pass
+            with self._display_guard():
+                try:
+                    # Method 1: Force cursor redraw at current position
+                    from Xlib.ext.xtest import fake_input
+                    from Xlib import X
+                    coord = self.root.query_pointer()._data
+                    current_x, current_y = coord["root_x"], coord["root_y"]
+                    fake_input(self.display, X.MotionNotify, x=current_x, y=current_y, root=self.root)
+                    # Prefer flush, only occasional sync
+                    self.display.flush()
+                    
+                    # Method 2: Force cursor visibility through root window
+                    self.root.change_attributes(cursor=0)  # Reset cursor
+                    self.display.flush()
+                except:
+                    pass
         
         # Avoid extra subprocess calls during frequent movement; these can accumulate
         # and degrade performance over time. Leave heavy wake methods disabled by default.
@@ -646,8 +760,9 @@ class X11MouseController:
     def get_mouse_position(self) -> Tuple[int, int]:
         """Get current mouse position using selected backend"""
         if self.backend == X11Backend.XLIB:
-            coord = self.root.query_pointer()._data
-            return coord["root_x"], coord["root_y"]
+            with self._display_guard():
+                coord = self.root.query_pointer()._data
+                return coord["root_x"], coord["root_y"]
             
         elif self.backend == X11Backend.XDOTOOL:
             try:
@@ -687,13 +802,14 @@ class X11MouseController:
         if self.backend == X11Backend.XLIB:
             from Xlib.ext.xtest import fake_input
             from Xlib import X
-            fake_input(self.display, X.MotionNotify, x=x, y=y)
-            # Throttle expensive syncs; avoid draining event queue here
-            self.movement_counter += 1
-            if self.movement_counter % 25 == 0:
-                self.display.sync()
-            else:
-                self.display.flush()
+            with self._display_guard():
+                fake_input(self.display, X.MotionNotify, x=x, y=y)
+                # Throttle expensive syncs; avoid draining event queue here
+                self.movement_counter += 1
+                if self.movement_counter % 25 == 0:
+                    self.display.sync()
+                else:
+                    self.display.flush()
             
         elif self.backend == X11Backend.XDOTOOL:
             subprocess.run(['xdotool', 'mousemove', str(x), str(y)], 
@@ -751,14 +867,15 @@ class X11MouseController:
                 self.cached_mouse_x = target_x
                 self.cached_mouse_y = target_y
 
-                fake_input(self.display, X.MotionNotify, x=target_x, y=target_y)
+                with self._display_guard():
+                    fake_input(self.display, X.MotionNotify, x=target_x, y=target_y)
 
-                # Less frequent sync to prevent server-side buildup
-                self.movement_counter += 1
-                if self.movement_counter % 20 == 0:
-                    self.display.sync()
-                else:
-                    self.display.flush()
+                    # Less frequent sync to prevent server-side buildup
+                    self.movement_counter += 1
+                    if self.movement_counter % 20 == 0:
+                        self.display.sync()
+                    else:
+                        self.display.flush()
             elif self.backend == X11Backend.XDOTOOL:
                 # Use Popen with proper cleanup to prevent subprocess buildup
                 proc = subprocess.Popen(['xdotool', 'mousemove_relative', '--', str(dx), str(dy)], 
@@ -849,13 +966,14 @@ class X11MouseController:
             from Xlib import X
             # Clamp to screen to avoid overshoot
             cx, cy = self._clamp_position(x, y)
-            fake_input(self.display, X.MotionNotify, x=cx, y=cy)
-            # Prefer flush; sync occasionally to avoid server lag
-            self.animation_move_counter += 1
-            if self.animation_move_counter % 20 == 0:
-                self.display.sync()
-            else:
-                self.display.flush()
+            with self._display_guard():
+                fake_input(self.display, X.MotionNotify, x=cx, y=cy)
+                # Prefer flush; sync occasionally to avoid server lag
+                self.animation_move_counter += 1
+                if self.animation_move_counter % 20 == 0:
+                    self.display.sync()
+                else:
+                    self.display.flush()
             
         elif self.backend == X11Backend.XDOTOOL:
             subprocess.run(['xdotool', 'mousemove', str(x), str(y)], 
@@ -871,10 +989,11 @@ class X11MouseController:
         if self.backend == X11Backend.XLIB:
             from Xlib.ext.xtest import fake_input
             from Xlib import X
-            fake_input(self.display, X.ButtonPress, button)
-            self.display.sync()
-            fake_input(self.display, X.ButtonRelease, button)
-            self.display.sync()
+            with self._display_guard():
+                fake_input(self.display, X.ButtonPress, button)
+                self.display.sync()
+                fake_input(self.display, X.ButtonRelease, button)
+                self.display.sync()
             
         elif self.backend == X11Backend.XDOTOOL:
             subprocess.run(['xdotool', 'click', str(button)], capture_output=True)
@@ -901,16 +1020,17 @@ class X11MouseController:
             from Xlib.ext.xtest import fake_input
             from Xlib import X
             button = 4 if clicks > 0 else 5
-            for _ in range(repeat):
-                fake_input(self.display, X.ButtonPress, button)
-                self.display.flush()
-                fake_input(self.display, X.ButtonRelease, button)
-                self.display.flush()
-            # Ensure events are delivered promptly
-            try:
-                self.display.sync()
-            except:
-                pass
+            with self._display_guard():
+                for _ in range(repeat):
+                    fake_input(self.display, X.ButtonPress, button)
+                    self.display.flush()
+                    fake_input(self.display, X.ButtonRelease, button)
+                    self.display.flush()
+                # Ensure events are delivered promptly
+                try:
+                    self.display.sync()
+                except:
+                    pass
         else:
             button = '4' if clicks > 0 else '5'
             try:
@@ -924,8 +1044,9 @@ class X11MouseController:
         if self.backend == X11Backend.XLIB:
             from Xlib.ext.xtest import fake_input
             from Xlib import X
-            fake_input(self.display, X.ButtonPress, button)
-            self.display.sync()
+            with self._display_guard():
+                fake_input(self.display, X.ButtonPress, button)
+                self.display.sync()
         else:
             subprocess.run(['xdotool', 'mousedown', str(button)], capture_output=True)
 
@@ -934,13 +1055,16 @@ class X11MouseController:
         if self.backend == X11Backend.XLIB:
             from Xlib.ext.xtest import fake_input
             from Xlib import X
-            fake_input(self.display, X.ButtonRelease, button)
-            self.display.sync()
+            with self._display_guard():
+                fake_input(self.display, X.ButtonRelease, button)
+                self.display.sync()
         else:
             subprocess.run(['xdotool', 'mouseup', str(button)], capture_output=True)
 
     def on_key_press(self, key):
         """Handle key press events"""
+        suppress = False
+        handle_locally = not self.key_grab_active
         try:
             if key == keyboard.Key.esc:
                 # Ignore ESC to avoid accidental app exit (e.g., GNOME overview sends ESC)
@@ -951,24 +1075,30 @@ class X11MouseController:
                 if not self.space_click_active:
                     self.space_click_active = True
                     self.press_mouse(1)
+                suppress = handle_locally
                 
             elif key in [keyboard.Key.ctrl_l, keyboard.Key.ctrl_r]:
                 self.ctrl_pressed = True
             
             elif key in [keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r]:
                 self.shift_pressed = True
-            
-            elif key in [keyboard.Key.cmd_l, keyboard.Key.cmd_r]:
-                self.super_pressed = True
-                
+
+            elif key in [keyboard.Key.alt_l, keyboard.Key.alt_r]:
+                if not self.alt_pressed:
+                    self.alt_pressed = True
+                    self._set_mouse_mode(True)
+                # Allow Alt to propagate so desktop shortcuts (Alt+Tab, etc.) keep working
+                suppress = False
+
             elif key in [keyboard.Key.up, keyboard.Key.down, 
                         keyboard.Key.left, keyboard.Key.right]:
-                if self.mouse_mode:
+                if self.mouse_mode and handle_locally:
                     # Start continuous movement for arrow keys
                     if key not in self.movement_keys:
-                        print(f"Arrow key pressed: {key}")
                         self.movement_keys.add(key)
                         self._start_continuous_movement()
+                    self._move_single_step(key)
+                    suppress = True
                 
             elif hasattr(key, 'char') and key.char:
                 raw_char = key.char
@@ -978,24 +1108,17 @@ class X11MouseController:
                     print("\nExiting...")
                     self.running = False
                     return False
-                if char == 'j' and self.super_pressed:
-                    # When X11 grabs are active, toggles are handled in X11 loop
-                    if not self.key_grab_active:
-                        self._toggle_mouse_mode()
-                elif self.mouse_mode:
-                    if char == 'x':
-                        # Exit mouse mode quickly
-                        if not self.key_grab_active:
-                            self._toggle_mouse_mode()
-                            return None
+                if self.mouse_mode and handle_locally:
                     # U/M => scroll
                     if char == 'u':
                         self.scroll_keys.add('up')
                         self._start_continuous_movement()
+                        suppress = True
                         return None
                     if char == 'm' or char == 'n':
                         self.scroll_keys.add('down')
                         self._start_continuous_movement()
+                        suppress = True
                         return None
                     # Handle IJKL navigation - continuous movement
                     movement_map = {
@@ -1008,23 +1131,29 @@ class X11MouseController:
                     if char in movement_map:
                         key_equivalent = movement_map[char]
                         if key_equivalent not in self.movement_keys:
-                            print(f"{char.upper()} key pressed ({key_equivalent.name})")
                             self.movement_keys.add(key_equivalent)
                             self._start_continuous_movement()
+                        self._move_single_step(key_equivalent)
+                        suppress = True
                     elif char == 'h':  # Left click
                         self.click_mouse(1)
-                        print("Left click (H)")
+                        suppress = True
                     elif char == ';':  # Right click
                         self.click_mouse(3)
-                        print("Right click (;)")
-                
+                        suppress = True
+
         except AttributeError:
             pass
-        
+        finally:
+            if suppress:
+                self._suppress_current_event()
+
         return None
 
     def on_key_release(self, key):
         """Handle key release events"""
+        suppress = False
+        handle_locally = not self.key_grab_active
         try:
             if key in [keyboard.Key.ctrl_l, keyboard.Key.ctrl_r]:
                 self.ctrl_pressed = False
@@ -1032,69 +1161,68 @@ class X11MouseController:
                 if self.space_click_active:
                     self.release_mouse(1)
                     self.space_click_active = False
+                suppress = handle_locally
                 
             elif key in [keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r]:
                 self.shift_pressed = False
-            elif key in [keyboard.Key.cmd_l, keyboard.Key.cmd_r]:
-                self.super_pressed = False
-                # After leaving GNOME overview, reapply grabs to restore suppression
-                self._regrab_navigation_keys()
+            elif key in [keyboard.Key.alt_l, keyboard.Key.alt_r]:
+                if self.alt_pressed:
+                    self.alt_pressed = False
+                    self._set_mouse_mode(False)
+                suppress = False
                 
             elif key in [keyboard.Key.up, keyboard.Key.down, 
                         keyboard.Key.left, keyboard.Key.right]:
-                if self.mouse_mode:
-                    # Stop continuous movement for arrow keys
-                    if key in self.movement_keys:
-                        print(f"Arrow key released: {key}")
-                        self.movement_keys.discard(key)
-                        if not self.movement_keys:
-                            self._stop_continuous_movement()
+                removed = self._release_movement_key(key)
+                if removed and (self.mouse_mode or handle_locally):
+                    suppress = handle_locally
                         
             elif hasattr(key, 'char') and key.char:
                 char = key.char.lower()
-                if self.mouse_mode:
-                    # Handle IJKL key releases
-                    movement_map = {
-                        'i': keyboard.Key.up,
-                        'j': keyboard.Key.left,
-                        'k': keyboard.Key.down,
-                        'l': keyboard.Key.right
-                    }
-                    
-                    if char in movement_map:
-                        key_equivalent = movement_map[char]
-                        if key_equivalent in self.movement_keys:
-                            print(f"{char.upper()} key released ({key_equivalent.name})")
-                            self.movement_keys.discard(key_equivalent)
-                            if not self.movement_keys and not self.scroll_keys:
-                                self._stop_continuous_movement()
-                    elif char == 'u':
-                        self.scroll_keys.discard('up')
-                        if not self.movement_keys and not self.scroll_keys:
-                            self._stop_continuous_movement()
-                    elif char == 'm' or char == 'n':
-                        self.scroll_keys.discard('down')
-                        if not self.movement_keys and not self.scroll_keys:
-                            self._stop_continuous_movement()
-                
+                # Handle IJKL key releases
+                movement_map = {
+                    'i': keyboard.Key.up,
+                    'j': keyboard.Key.left,
+                    'k': keyboard.Key.down,
+                    'l': keyboard.Key.right
+                }
+
+                if char in movement_map:
+                    removed = self._release_movement_key(movement_map[char])
+                    if removed and (self.mouse_mode or handle_locally):
+                        suppress = handle_locally
+                elif char == 'u':
+                    removed = self._release_scroll_key('up')
+                    if removed and (self.mouse_mode or handle_locally):
+                        suppress = handle_locally
+                elif char == 'm' or char == 'n':
+                    removed = self._release_scroll_key('down')
+                    if removed and (self.mouse_mode or handle_locally):
+                        suppress = handle_locally
+
         except AttributeError:
             pass
-        
+        finally:
+            if suppress:
+                self._suppress_current_event()
+
         return None
 
     def _move_single_step(self, direction_key):
         """Move mouse by a single step in the given direction"""
         if not self.mouse_mode:
-            print("Mouse mode is OFF - press Super+J to enable")
+            print("Mouse control is inactive - hold Alt to engage")
             return
             
         # Determine movement distance
         if self.ctrl_pressed:
             move_distance = self.ctrl_leap_distance
-            print(f"Moving {move_distance}px (Ctrl held)")
+            if self.debug:
+                print(f"Moving {move_distance}px (Ctrl held)")
         else:
             move_distance = self.move_speed
-            print(f"Moving {move_distance}px")
+            if self.debug:
+                print(f"Moving {move_distance}px")
         
         # Calculate movement direction
         dx = dy = 0
@@ -1109,7 +1237,8 @@ class X11MouseController:
         
         # Perform movement
         if dx != 0 or dy != 0:
-            print(f"Moving cursor by dx={dx}, dy={dy}")
+            if self.debug:
+                print(f"Moving cursor by dx={dx}, dy={dy}")
             self.move_mouse_relative(dx, dy)
 
     def _start_continuous_movement(self):
@@ -1120,14 +1249,16 @@ class X11MouseController:
             self.movement_active = True
             self.movement_thread = threading.Thread(target=self._continuous_movement_loop, daemon=True)
             self.movement_thread.start()
-            print("Started continuous movement")
+            if self.debug:
+                print("Started continuous movement")
 
     def _stop_continuous_movement(self):
         """Stop continuous movement"""
         self.movement_active = False
         if self.movement_thread:
             self.movement_thread = None
-        print("Stopped continuous movement")
+        if self.debug:
+            print("Stopped continuous movement")
 
     def _continuous_movement_loop(self):
         """Continuous movement loop that runs in a separate thread"""
@@ -1186,7 +1317,8 @@ class X11MouseController:
                     gc.collect()
                     if self.backend == X11Backend.XLIB:
                         try:
-                            self.display.flush()
+                            with self._display_guard():
+                                self.display.flush()
                         except:
                             pass
                     self.last_gc_time = current_time
@@ -1200,13 +1332,13 @@ class X11MouseController:
     def run(self):
         """Main application loop"""
         # Set up keyboard listener
-        listener = keyboard.Listener(
+        self.listener = keyboard.Listener(
             on_press=self.on_key_press,
             on_release=self.on_key_release,
             suppress=False
         )
         
-        listener.start()
+        self.listener.start()
         
         try:
             while self.running:
@@ -1225,7 +1357,9 @@ class X11MouseController:
         finally:
             # Stop continuous movement
             self._stop_continuous_movement()
-            listener.stop()
+            if self.listener:
+                self.listener.stop()
+                self.listener = None
             # Ungrab keys on exit (this also stops X11 event handling)
             self._ungrab_navigation_keys()
             # Restore cursor visibility and screensaver on exit
@@ -1235,9 +1369,12 @@ class X11MouseController:
 
 def main():
     """Main entry point with backend selection"""
-    # Ignore SIGINT so Ctrl+C (e.g., copy) doesn't stop the app
+    def _handle_signal(signum, frame):
+        raise KeyboardInterrupt()
+
     try:
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, _handle_signal)
+        signal.signal(signal.SIGTERM, _handle_signal)
     except Exception:
         pass
     # Default backend from config
