@@ -36,13 +36,12 @@ class X11MouseController:
         self.acceleration = acceleration if acceleration is not None else float(getattr(config, 'ACCELERATION', 1.5))
         self.current_speed = self.move_speed
         self.running = True
-        self.mouse_mode = False  # This will now be controlled by Alt key state
+        self.mouse_mode = False
         self.pressed_keys = set()
         self.movement_keys = set()  # Track which movement keys are pressed
         self.ctrl_pressed = False
         self.super_pressed = False
         self.shift_pressed = False
-        self.alt_pressed = False  # Track Alt key state for mouse control
         self.ctrl_leap_distance = int(getattr(config, 'CTRL_LEAP_DISTANCE', 50))  # Ctrl modifier distance
         self.last_cursor_refresh = 0  # Track last cursor refresh time
         self.space_click_active = False  # Track Space-as-left-button state
@@ -52,9 +51,6 @@ class X11MouseController:
         self.key_grab_active = False
         self.x11_event_thread = None
         self.x11_events_active = False
-
-        # Thread synchronization for X11 display access
-        self.display_lock = threading.Lock()
 
         # Continuous movement settings
         self.movement_thread = None
@@ -112,16 +108,15 @@ class X11MouseController:
         
         print(f"X11 Mouse Controller Started! (Backend: {backend.value})")
         print("Controls:")
-        print(f"  Alt+Arrow Keys or Alt+I/J/K/L: Move mouse ({self.move_speed}px per press)")
-        print(f"  Alt+Ctrl+Movement: Larger steps ({self.ctrl_leap_distance}px per press)")
-        print("  Alt+U: Scroll up; Alt+M/N: Scroll down")
-        print("  Alt+H/Space: Left click (hold Space to drag/select); Alt+;: Right click")
+        print(f"  Arrow Keys or I/J/K/L: Move mouse ({self.move_speed}px per press)")
+        print(f"  Ctrl + Movement: Larger steps ({self.ctrl_leap_distance}px per press)")
+        print("  U: Scroll up; M/N: Scroll down")
+        print("  Super+J: Toggle mouse mode on/off; X: Exit mouse mode")
         print("  Ctrl+Q: Exit app")
+        print("  H/Space: Left click (hold Space to drag/select); ;: Right click")
         smooth_status = "ON" if self.smooth_movement else "OFF"
         print(f"\nSmooth movement: {smooth_status}")
-        print(f"Mouse control: Hold Alt + navigation keys to move cursor")
-
-        # All key detection is handled via the pynput listener; Alt toggles mouse mode
+        print(f"Mouse mode: OFF - Press Super+J to toggle...")
 
     def _init_backend(self):
         """Initialize the selected X11 backend"""
@@ -256,26 +251,18 @@ class X11MouseController:
         except:
             pass
 
-    def _set_mouse_mode(self, enabled):
-        """Set mouse mode based on Alt key state"""
-        enabled = bool(enabled)
-        if self.mouse_mode == enabled:
-            return
+    def _toggle_mouse_mode(self):
+        """Toggle mouse mode and (un)grab keys accordingly"""
+        self.mouse_mode = not self.mouse_mode
+        self.pressed_keys.clear()
 
-        self.mouse_mode = enabled
-        if enabled:
-            # Align cached position with actual cursor and reset state for fresh movement
-            self._sync_cached_position_from_os()
-            print("\nMouse control: ACTIVE (Alt held)")
+        if self.mouse_mode:
+            self._grab_navigation_keys()
         else:
-            # Stop any active movement/scroll state when leaving mouse mode
-            self.movement_keys.clear()
-            self.scroll_keys.clear()
-            self._stop_continuous_movement()
-            if self.space_click_active:
-                self.release_mouse(1)
-                self.space_click_active = False
-            print("\nMouse control: INACTIVE (Alt released)")
+            self._ungrab_navigation_keys()
+
+        status = "ON" if self.mouse_mode else "OFF"
+        print(f"\nMouse mode: {status}")
 
     def _push_ignore_badaccess(self):
         """Temporarily ignore BadAccess X errors (used during grab/ungrab)."""
@@ -313,81 +300,19 @@ class X11MouseController:
         except:
             pass
 
-    def _grab_alt_keys_only(self):
-        """Initially grab only Alt keys to detect when they are pressed"""
-        if self.backend != X11Backend.XLIB:
-            return  # Only works with direct X11 access
-
-        try:
-            from Xlib import X
-            import Xlib.XK
-
-            # Only grab Alt keys initially
-            alt_keys = {
-                'alt_l': Xlib.XK.XK_Alt_L,
-                'alt_r': Xlib.XK.XK_Alt_R,
-            }
-
-            # Account for CapsLock/NumLock/Super states
-            caps_variants = [0, X.LockMask]         # CapsLock
-            numlock_variants = [0, X.Mod2Mask]      # NumLock
-            super_variants = [0, X.Mod4Mask]        # Super/Windows
-
-            alt_key_combinations = set()
-            base_mods = [0]  # No modifiers for Alt keys themselves
-
-            for base in base_mods:
-                for caps in caps_variants:
-                    for numl in numlock_variants:
-                        for sup in super_variants:
-                            alt_key_combinations.add(base | caps | numl | sup)
-
-            # Suppress BadAccess errors during grabs
-            self._push_ignore_badaccess()
-            try:
-                for key_name, keysym in alt_keys.items():
-                    try:
-                        keycode = self.display.keysym_to_keycode(keysym)
-                        if self.debug:
-                            print(f"DEBUG: Alt key {key_name} -> keysym: {keysym}, keycode: {keycode}")
-                        if keycode != 0:
-                            for modifiers in alt_key_combinations:
-                                try:
-                                    self.root.grab_key(keycode, modifiers, False, X.GrabModeAsync, X.GrabModeAsync)
-                                    self.grabbed_keys.add((keycode, modifiers))
-                                    if self.debug:
-                                        print(f"DEBUG: Grabbed {key_name} with modifiers {modifiers}")
-                                except Exception as e:
-                                    if self.debug:
-                                        print(f"DEBUG: Failed to grab {key_name} with modifiers {modifiers}: {e}")
-                        else:
-                            if self.debug:
-                                print(f"DEBUG: No keycode for {key_name}")
-                    except Exception as e:
-                        if self.debug:
-                            print(f"DEBUG: Error processing {key_name}: {e}")
-                        continue
-                self.display.sync()
-            finally:
-                self._pop_error_handler()
-
-            # Start X11 event handling thread for grabbed keys
-            self._start_x11_event_handling()
-
-            print(f"✓ Grabbed Alt keys for detection (grabbed {len(self.grabbed_keys)} key combinations)")
-        except Exception as e:
-            print(f"✗ Could not grab Alt keys: {e}")
-
     def _grab_navigation_keys(self):
-        """Grab navigation keys when mouse mode is activated"""
+        """Grab navigation keys to prevent them from reaching other applications"""
         if self.backend != X11Backend.XLIB:
             return  # Only works with direct X11 access
+
+        if self.key_grab_active:
+            return  # Already grabbed
 
         try:
             from Xlib import X
             import Xlib.XK
 
-            # Define navigation keys to grab (excluding Alt keys which are already grabbed)
+            # Define keys to grab with their keysyms
             navigation_keys = {
                 # Arrow keys
                 'Up': Xlib.XK.XK_Up,
@@ -403,40 +328,45 @@ class X11MouseController:
                 'u': Xlib.XK.XK_u,
                 'm': Xlib.XK.XK_m,
                 'n': Xlib.XK.XK_n,
+                # Exit key
+                'x': Xlib.XK.XK_x,
                 # Click keys
                 'h': Xlib.XK.XK_h,
                 'semicolon': Xlib.XK.XK_semicolon,
                 'space': Xlib.XK.XK_space
             }
 
-            # Navigation key combinations (with Alt)
-            nav_key_combinations = set()
-            base_nav_mods = [
-                X.Mod1Mask,  # Alt only
-                X.Mod1Mask | X.ControlMask,  # Alt+Ctrl
-                X.Mod1Mask | X.ShiftMask,    # Alt+Shift
-                X.Mod1Mask | X.ControlMask | X.ShiftMask,  # Alt+Ctrl+Shift
+            # Build comprehensive modifier combinations to account for CapsLock/NumLock/Super states
+            base_mods = [
+                0,
+                X.ControlMask,
+                X.ShiftMask,
+                X.Mod1Mask,  # Alt
+                X.ControlMask | X.ShiftMask,
+                X.ControlMask | X.Mod1Mask,
+                X.ShiftMask | X.Mod1Mask,
+                X.ControlMask | X.ShiftMask | X.Mod1Mask,
             ]
 
-            # Account for CapsLock/NumLock/Super states
             caps_variants = [0, X.LockMask]         # CapsLock
             numlock_variants = [0, X.Mod2Mask]      # NumLock
             super_variants = [0, X.Mod4Mask]        # Super/Windows
 
-            for base in base_nav_mods:
+            all_modifier_combinations = set()
+            for base in base_mods:
                 for caps in caps_variants:
                     for numl in numlock_variants:
                         for sup in super_variants:
-                            nav_key_combinations.add(base | caps | numl | sup)
+                            all_modifier_combinations.add(base | caps | numl | sup)
 
-            # Suppress BadAccess errors during grabs
+            # Suppress BadAccess errors during grabs (some combos may already be grabbed)
             self._push_ignore_badaccess()
             try:
                 for key_name, keysym in navigation_keys.items():
                     try:
                         keycode = self.display.keysym_to_keycode(keysym)
                         if keycode != 0:
-                            for modifiers in nav_key_combinations:
+                            for modifiers in all_modifier_combinations:
                                 try:
                                     self.root.grab_key(keycode, modifiers, False, X.GrabModeAsync, X.GrabModeAsync)
                                     self.grabbed_keys.add((keycode, modifiers))
@@ -445,59 +375,21 @@ class X11MouseController:
                     except:
                         continue
                 self.display.sync()
-                self.key_grab_active = True
             finally:
                 self._pop_error_handler()
 
-            print(f"✓ Grabbed navigation keys for suppression (total grabbed: {len(self.grabbed_keys)} key combinations)")
+            self.key_grab_active = True
+
+            # Start X11 event handling thread for grabbed keys
+            self._start_x11_event_handling()
+
+            print(f"✓ Grabbed navigation keys for suppression (grabbed {len(self.grabbed_keys)} key combinations)")
         except Exception as e:
-            print(f"✗ Could not grab navigation keys: {e}")
-
-    def _ungrab_navigation_keys_only(self):
-        """Release grabbed navigation keys but keep Alt keys grabbed"""
-        if self.backend != X11Backend.XLIB:
-            return
-
-        try:
-            from Xlib import X
-            import Xlib.XK
-
-            # Identify which grabbed keys are Alt keys (to keep them)
-            alt_keysyms = {Xlib.XK.XK_Alt_L, Xlib.XK.XK_Alt_R}
-            alt_keycodes = set()
-            for keysym in alt_keysyms:
-                keycode = self.display.keysym_to_keycode(keysym)
-                if keycode != 0:
-                    alt_keycodes.add(keycode)
-
-            # Ungrab all keys except Alt keys
-            self._push_ignore_badaccess()
-            try:
-                keys_to_remove = []
-                for keycode, modifiers in self.grabbed_keys:
-                    if keycode not in alt_keycodes:  # Not an Alt key
-                        try:
-                            self.root.ungrab_key(keycode, modifiers)
-                            keys_to_remove.append((keycode, modifiers))
-                        except:
-                            pass
-
-                # Remove ungrabbed keys from the tracking set
-                for key_combo in keys_to_remove:
-                    self.grabbed_keys.discard(key_combo)
-
-                self.display.sync()
-            finally:
-                self._pop_error_handler()
-
-            print("✓ Released navigation key grabs (kept Alt keys)")
-            self.key_grab_active = False
-        except:
-            pass
+            print(f"✗ Could not grab keys: {e}")
 
     def _ungrab_navigation_keys(self):
         """Release grabbed navigation keys"""
-        if self.backend != X11Backend.XLIB or not self.grabbed_keys:
+        if self.backend != X11Backend.XLIB or not self.key_grab_active:
             return
 
         try:
@@ -562,30 +454,21 @@ class X11MouseController:
         """X11 event loop to handle grabbed key events"""
         from Xlib import X
 
-        if self.debug:
-            print("DEBUG: X11 event loop started")
-
         while self.x11_events_active and self.running:
             try:
                 # Check for pending X11 events (non-blocking)
-                with self.display_lock:
-                    pending = self.display.pending_events()
-                    if pending > 0:
-                        if self.debug:
-                            print(f"DEBUG: {pending} pending X11 events")
-                        event = self.display.next_event()
+                if self.display.pending_events() > 0:
+                    event = self.display.next_event()
 
-                        # Handle KeyPress events for grabbed keys
-                        if event.type == X.KeyPress:
-                            self._handle_grabbed_key_event(event)
-                        # Consume KeyRelease events too to prevent them from propagating
-                        elif event.type == X.KeyRelease:
-                            self._handle_grabbed_key_event(event)
+                    # Handle KeyPress events for grabbed keys
+                    if event.type == X.KeyPress:
+                        self._handle_grabbed_key_event(event)
+                    # Consume KeyRelease events too to prevent them from propagating
+                    elif event.type == X.KeyRelease:
+                        self._handle_grabbed_key_event(event)
 
                 time.sleep(0.001)  # Small sleep to prevent CPU spinning
-            except Exception as e:
-                if self.debug:
-                    print(f"DEBUG: X11 event loop error: {e}")
+            except:
                 break
 
     def _handle_grabbed_key_event(self, event):
@@ -597,30 +480,22 @@ class X11MouseController:
             # Get keycode from event
             keycode = event.detail
 
-            # Convert keycode back to keysym to identify the key (this needs display access)
-            with self.display_lock:
-                keysym = self.display.keycode_to_keysym(keycode, 0)
+            # Convert keycode back to keysym to identify the key
+            keysym = self.display.keycode_to_keysym(keycode, 0)
 
             # Debug logging suppressed by default
             if self.debug:
                 event_type = "KeyPress" if event.type == X.KeyPress else "KeyRelease"
                 key_name = Xlib.XK.keysym_to_string(keysym) or f"keysym_{keysym}"
-                print(f"DEBUG: Grabbed {event_type} for key: {key_name} (keysym: {keysym})")
+                print(f"DEBUG: Grabbed {event_type} for key: {key_name}")
 
-            # Handle both KeyPress and KeyRelease for proper Alt tracking
+            # Only handle KeyPress events for actions (ignore KeyRelease)
             if event.type == X.KeyPress:
-                # For any key event, treat Alt as held if the current combo includes it
-                # or if we already recorded an active Alt press (grabs can zero event.state).
-                is_alt = bool(event.state & X.Mod1Mask) or self.alt_pressed
-
-                # Handle Alt key press alone to activate mouse mode
-                if keysym in [Xlib.XK.XK_Alt_L, Xlib.XK.XK_Alt_R]:
-                    self.alt_pressed = True
-                    self._set_mouse_mode(True)
-                    return
-
-                # For navigation keys, only process when Alt is held
-                if not is_alt:
+                # Handle Super+J toggle at X11 level to prevent leakage
+                is_super = bool(event.state & X.Mod4Mask)
+                is_shift = bool(event.state & X.ShiftMask)
+                if is_super and keysym == Xlib.XK.XK_j:
+                    self._toggle_mouse_mode()
                     return
 
                 # Space acts as left-button hold (drag). Tap = click.
@@ -630,6 +505,11 @@ class X11MouseController:
                         self.press_mouse(1)
                     return
 
+                # X => force exit mouse mode
+                if keysym == Xlib.XK.XK_x:
+                    if self.mouse_mode:
+                        self._toggle_mouse_mode()
+                    return
 
                 # U/M => scroll up/down
                 if keysym == Xlib.XK.XK_u:
@@ -687,12 +567,6 @@ class X11MouseController:
                         print("Right click")
 
             elif event.type == X.KeyRelease:
-                # Handle Alt key release to deactivate mouse mode
-                if keysym in [Xlib.XK.XK_Alt_L, Xlib.XK.XK_Alt_R]:
-                    self.alt_pressed = False
-                    self._set_mouse_mode(False)
-                    return
-
                 # Handle key releases to stop movement
                 if keysym == Xlib.XK.XK_space:
                     if self.space_click_active:
@@ -747,19 +621,18 @@ class X11MouseController:
 
         if self.backend == X11Backend.XLIB:
             try:
-                with self.display_lock:
-                    # Method 1: Force cursor redraw at current position
-                    from Xlib.ext.xtest import fake_input
-                    from Xlib import X
-                    coord = self.root.query_pointer()._data
-                    current_x, current_y = coord["root_x"], coord["root_y"]
-                    fake_input(self.display, X.MotionNotify, x=current_x, y=current_y, root=self.root)
-                    # Prefer flush, only occasional sync
-                    self.display.flush()
-
-                    # Method 2: Force cursor visibility through root window
-                    self.root.change_attributes(cursor=0)  # Reset cursor
-                    self.display.flush()
+                # Method 1: Force cursor redraw at current position
+                from Xlib.ext.xtest import fake_input
+                from Xlib import X
+                coord = self.root.query_pointer()._data
+                current_x, current_y = coord["root_x"], coord["root_y"]
+                fake_input(self.display, X.MotionNotify, x=current_x, y=current_y, root=self.root)
+                # Prefer flush, only occasional sync
+                self.display.flush()
+                
+                # Method 2: Force cursor visibility through root window
+                self.root.change_attributes(cursor=0)  # Reset cursor
+                self.display.flush()
             except:
                 pass
         
@@ -773,9 +646,8 @@ class X11MouseController:
     def get_mouse_position(self) -> Tuple[int, int]:
         """Get current mouse position using selected backend"""
         if self.backend == X11Backend.XLIB:
-            with self.display_lock:
-                coord = self.root.query_pointer()._data
-                return coord["root_x"], coord["root_y"]
+            coord = self.root.query_pointer()._data
+            return coord["root_x"], coord["root_y"]
             
         elif self.backend == X11Backend.XDOTOOL:
             try:
@@ -813,16 +685,15 @@ class X11MouseController:
         # Clamp target within screen bounds when known
         x, y = self._clamp_position(x, y)
         if self.backend == X11Backend.XLIB:
-            with self.display_lock:
-                from Xlib.ext.xtest import fake_input
-                from Xlib import X
-                fake_input(self.display, X.MotionNotify, x=x, y=y)
-                # Throttle expensive syncs; avoid draining event queue here
-                self.movement_counter += 1
-                if self.movement_counter % 25 == 0:
-                    self.display.sync()
-                else:
-                    self.display.flush()
+            from Xlib.ext.xtest import fake_input
+            from Xlib import X
+            fake_input(self.display, X.MotionNotify, x=x, y=y)
+            # Throttle expensive syncs; avoid draining event queue here
+            self.movement_counter += 1
+            if self.movement_counter % 25 == 0:
+                self.display.sync()
+            else:
+                self.display.flush()
             
         elif self.backend == X11Backend.XDOTOOL:
             subprocess.run(['xdotool', 'mousemove', str(x), str(y)], 
@@ -864,6 +735,9 @@ class X11MouseController:
             # Direct movement (original behavior)
             if self.backend == X11Backend.XLIB:
                 # Use cached position; clamp to screen to prevent overshoot beyond edges
+                from Xlib.ext.xtest import fake_input
+                from Xlib import X
+
                 if self.last_position_update == 0:
                     # Initialize from actual OS position on first move
                     self.cached_mouse_x, self.cached_mouse_y = self.get_mouse_position()
@@ -877,17 +751,14 @@ class X11MouseController:
                 self.cached_mouse_x = target_x
                 self.cached_mouse_y = target_y
 
-                with self.display_lock:
-                    from Xlib.ext.xtest import fake_input
-                    from Xlib import X
-                    fake_input(self.display, X.MotionNotify, x=target_x, y=target_y)
+                fake_input(self.display, X.MotionNotify, x=target_x, y=target_y)
 
-                    # Less frequent sync to prevent server-side buildup
-                    self.movement_counter += 1
-                    if self.movement_counter % 20 == 0:
-                        self.display.sync()
-                    else:
-                        self.display.flush()
+                # Less frequent sync to prevent server-side buildup
+                self.movement_counter += 1
+                if self.movement_counter % 20 == 0:
+                    self.display.sync()
+                else:
+                    self.display.flush()
             elif self.backend == X11Backend.XDOTOOL:
                 # Use Popen with proper cleanup to prevent subprocess buildup
                 proc = subprocess.Popen(['xdotool', 'mousemove_relative', '--', str(dx), str(dy)], 
@@ -974,18 +845,17 @@ class X11MouseController:
     def _move_mouse_direct(self, x: int, y: int):
         """Direct mouse movement without wake cursor calls (for animation)"""
         if self.backend == X11Backend.XLIB:
+            from Xlib.ext.xtest import fake_input
+            from Xlib import X
             # Clamp to screen to avoid overshoot
             cx, cy = self._clamp_position(x, y)
-            with self.display_lock:
-                from Xlib.ext.xtest import fake_input
-                from Xlib import X
-                fake_input(self.display, X.MotionNotify, x=cx, y=cy)
-                # Prefer flush; sync occasionally to avoid server lag
-                self.animation_move_counter += 1
-                if self.animation_move_counter % 20 == 0:
-                    self.display.sync()
-                else:
-                    self.display.flush()
+            fake_input(self.display, X.MotionNotify, x=cx, y=cy)
+            # Prefer flush; sync occasionally to avoid server lag
+            self.animation_move_counter += 1
+            if self.animation_move_counter % 20 == 0:
+                self.display.sync()
+            else:
+                self.display.flush()
             
         elif self.backend == X11Backend.XDOTOOL:
             subprocess.run(['xdotool', 'mousemove', str(x), str(y)], 
@@ -999,13 +869,12 @@ class X11MouseController:
     def click_mouse(self, button: int = 1):
         """Click mouse button (1=left, 2=middle, 3=right)"""
         if self.backend == X11Backend.XLIB:
-            with self.display_lock:
-                from Xlib.ext.xtest import fake_input
-                from Xlib import X
-                fake_input(self.display, X.ButtonPress, button)
-                self.display.sync()
-                fake_input(self.display, X.ButtonRelease, button)
-                self.display.sync()
+            from Xlib.ext.xtest import fake_input
+            from Xlib import X
+            fake_input(self.display, X.ButtonPress, button)
+            self.display.sync()
+            fake_input(self.display, X.ButtonRelease, button)
+            self.display.sync()
             
         elif self.backend == X11Backend.XDOTOOL:
             subprocess.run(['xdotool', 'click', str(button)], capture_output=True)
@@ -1029,20 +898,19 @@ class X11MouseController:
                 if self.debug:
                     print(f"ydotool scroll failed: {e}. Falling back to X methods.")
         if self.backend == X11Backend.XLIB:
-            with self.display_lock:
-                from Xlib.ext.xtest import fake_input
-                from Xlib import X
-                button = 4 if clicks > 0 else 5
-                for _ in range(repeat):
-                    fake_input(self.display, X.ButtonPress, button)
-                    self.display.flush()
-                    fake_input(self.display, X.ButtonRelease, button)
-                    self.display.flush()
-                # Ensure events are delivered promptly
-                try:
-                    self.display.sync()
-                except:
-                    pass
+            from Xlib.ext.xtest import fake_input
+            from Xlib import X
+            button = 4 if clicks > 0 else 5
+            for _ in range(repeat):
+                fake_input(self.display, X.ButtonPress, button)
+                self.display.flush()
+                fake_input(self.display, X.ButtonRelease, button)
+                self.display.flush()
+            # Ensure events are delivered promptly
+            try:
+                self.display.sync()
+            except:
+                pass
         else:
             button = '4' if clicks > 0 else '5'
             try:
@@ -1054,22 +922,20 @@ class X11MouseController:
     def press_mouse(self, button: int = 1):
         """Press mouse button down (for drag/select)."""
         if self.backend == X11Backend.XLIB:
-            with self.display_lock:
-                from Xlib.ext.xtest import fake_input
-                from Xlib import X
-                fake_input(self.display, X.ButtonPress, button)
-                self.display.sync()
+            from Xlib.ext.xtest import fake_input
+            from Xlib import X
+            fake_input(self.display, X.ButtonPress, button)
+            self.display.sync()
         else:
             subprocess.run(['xdotool', 'mousedown', str(button)], capture_output=True)
 
     def release_mouse(self, button: int = 1):
         """Release mouse button (for drag/select)."""
         if self.backend == X11Backend.XLIB:
-            with self.display_lock:
-                from Xlib.ext.xtest import fake_input
-                from Xlib import X
-                fake_input(self.display, X.ButtonRelease, button)
-                self.display.sync()
+            from Xlib.ext.xtest import fake_input
+            from Xlib import X
+            fake_input(self.display, X.ButtonRelease, button)
+            self.display.sync()
         else:
             subprocess.run(['xdotool', 'mouseup', str(button)], capture_output=True)
 
@@ -1088,16 +954,12 @@ class X11MouseController:
                 
             elif key in [keyboard.Key.ctrl_l, keyboard.Key.ctrl_r]:
                 self.ctrl_pressed = True
-
+            
             elif key in [keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r]:
                 self.shift_pressed = True
-
+            
             elif key in [keyboard.Key.cmd_l, keyboard.Key.cmd_r]:
                 self.super_pressed = True
-
-            elif key in [keyboard.Key.alt_l, keyboard.Key.alt_r]:
-                self.alt_pressed = True
-                self._set_mouse_mode(True)
                 
             elif key in [keyboard.Key.up, keyboard.Key.down, 
                         keyboard.Key.left, keyboard.Key.right]:
@@ -1107,7 +969,6 @@ class X11MouseController:
                         print(f"Arrow key pressed: {key}")
                         self.movement_keys.add(key)
                         self._start_continuous_movement()
-                    self._move_single_step(key)
                 
             elif hasattr(key, 'char') and key.char:
                 raw_char = key.char
@@ -1117,7 +978,16 @@ class X11MouseController:
                     print("\nExiting...")
                     self.running = False
                     return False
+                if char == 'j' and self.super_pressed:
+                    # When X11 grabs are active, toggles are handled in X11 loop
+                    if not self.key_grab_active:
+                        self._toggle_mouse_mode()
                 elif self.mouse_mode:
+                    if char == 'x':
+                        # Exit mouse mode quickly
+                        if not self.key_grab_active:
+                            self._toggle_mouse_mode()
+                            return None
                     # U/M => scroll
                     if char == 'u':
                         self.scroll_keys.add('up')
@@ -1141,7 +1011,6 @@ class X11MouseController:
                             print(f"{char.upper()} key pressed ({key_equivalent.name})")
                             self.movement_keys.add(key_equivalent)
                             self._start_continuous_movement()
-                        self._move_single_step(key_equivalent)
                     elif char == 'h':  # Left click
                         self.click_mouse(1)
                         print("Left click (H)")
@@ -1168,9 +1037,8 @@ class X11MouseController:
                 self.shift_pressed = False
             elif key in [keyboard.Key.cmd_l, keyboard.Key.cmd_r]:
                 self.super_pressed = False
-            elif key in [keyboard.Key.alt_l, keyboard.Key.alt_r]:
-                self.alt_pressed = False
-                self._set_mouse_mode(False)
+                # After leaving GNOME overview, reapply grabs to restore suppression
+                self._regrab_navigation_keys()
                 
             elif key in [keyboard.Key.up, keyboard.Key.down, 
                         keyboard.Key.left, keyboard.Key.right]:
@@ -1217,17 +1085,16 @@ class X11MouseController:
     def _move_single_step(self, direction_key):
         """Move mouse by a single step in the given direction"""
         if not self.mouse_mode:
+            print("Mouse mode is OFF - press Super+J to enable")
             return
             
         # Determine movement distance
         if self.ctrl_pressed:
             move_distance = self.ctrl_leap_distance
-            if self.debug:
-                print(f"Moving {move_distance}px (Ctrl held)")
+            print(f"Moving {move_distance}px (Ctrl held)")
         else:
             move_distance = self.move_speed
-            if self.debug:
-                print(f"Moving {move_distance}px")
+            print(f"Moving {move_distance}px")
         
         # Calculate movement direction
         dx = dy = 0
@@ -1242,8 +1109,7 @@ class X11MouseController:
         
         # Perform movement
         if dx != 0 or dy != 0:
-            if self.debug:
-                print(f"Moving cursor by dx={dx}, dy={dy}")
+            print(f"Moving cursor by dx={dx}, dy={dy}")
             self.move_mouse_relative(dx, dy)
 
     def _start_continuous_movement(self):
@@ -1320,8 +1186,7 @@ class X11MouseController:
                     gc.collect()
                     if self.backend == X11Backend.XLIB:
                         try:
-                            with self.display_lock:
-                                self.display.flush()
+                            self.display.flush()
                         except:
                             pass
                     self.last_gc_time = current_time
@@ -1346,18 +1211,17 @@ class X11MouseController:
         try:
             while self.running:
                 current_time = time.time()
-
+                
                 # Periodic cursor refresh only when idle for > 2s to avoid subprocess churn
                 if (current_time - self.last_cursor_refresh > 5.0 and
                     current_time - self.last_movement_time > 2.0):
                     self._restore_cursor_visibility()
                     self.last_cursor_refresh = current_time
-
+                
                 time.sleep(0.01)  # 100 FPS - just for keeping the loop alive
-
+                
         except KeyboardInterrupt:
-            print("\nExiting (Ctrl+C)")
-            self.running = False
+            print("\nForce exit (Ctrl+C)")
         finally:
             # Stop continuous movement
             self._stop_continuous_movement()
@@ -1371,15 +1235,11 @@ class X11MouseController:
 
 def main():
     """Main entry point with backend selection"""
-    # Set up signal handler for clean exit
-    def signal_handler(signum, frame):
-        print(f"\nReceived signal {signum}, exiting...")
-        import sys
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
+    # Ignore SIGINT so Ctrl+C (e.g., copy) doesn't stop the app
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except Exception:
+        pass
     # Default backend from config
     default_backend_name = getattr(config, 'DEFAULT_BACKEND', 'xlib').lower()
     backend_map = {
