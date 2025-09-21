@@ -1444,7 +1444,7 @@ class X11MouseController:
 
     def _start_continuous_movement(self):
         """Start continuous movement thread if not already running"""
-        if not self.movement_active and self.movement_keys:
+        if not self.movement_active and (self.movement_keys or self.scroll_keys):
             # Sync cached position from actual OS cursor on movement start
             self._sync_cached_position_from_os()
             self.movement_active = True
