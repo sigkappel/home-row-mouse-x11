@@ -42,4 +42,29 @@ WAKE_THROTTLE_SEC = 0.25
 CURSOR_REFRESH_IDLE_SEC = 2.0
 CURSOR_REFRESH_INTERVAL_SEC = 5.0
 
+# Key bindings ---------------------------------------------------------------
+#
+# Each binding list can contain multiple key tokens; any of them will trigger
+# the associated action. Tokens should match X11 keysyms (e.g. "Up",
+# "KP_Insert") or literal characters ("h", ";"). Case is ignored where
+# applicable. Pynput falls back to treating single characters as lowercase.
 
+NAVIGATION_KEYS = {
+    "up": ["Up", "i"],
+    "down": ["Down", "k"],
+    "left": ["Left", "j"],
+    "right": ["Right", "l"],
+}
+
+SCROLL_KEYS = {
+    "up": ["u"],
+    "down": ["m", "n"],
+}
+
+CLICK_KEYS = {
+    "left": ["h", "KP_Insert"],
+    "right": ["semicolon", "KP_Delete"],
+}
+
+# Keys that press-and-hold the primary button (e.g., for dragging)
+CLICK_HOLD_KEYS = ["space"]

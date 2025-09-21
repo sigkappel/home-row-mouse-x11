@@ -14,13 +14,60 @@ from contextlib import nullcontext
 from pynput import keyboard
 import config
 from enum import Enum
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict, Iterable, Any
 import signal
 
 class X11Backend(Enum):
     XLIB = "xlib"           # Direct python3-xlib (fastest)
     XDOTOOL = "xdotool"     # Command-line xdotool (most compatible)
     XINPUT = "xinput"       # Low-level device control
+
+
+DEFAULT_NAVIGATION_KEYS = {
+    "up": ["Up", "i"],
+    "down": ["Down", "k"],
+    "left": ["Left", "j"],
+    "right": ["Right", "l"],
+}
+
+DEFAULT_SCROLL_KEYS = {
+    "up": ["u"],
+    "down": ["m", "n"],
+}
+
+DEFAULT_CLICK_KEYS = {
+    "left": ["h", "KP_Insert"],
+    "right": ["semicolon", "KP_Delete"],
+}
+
+DEFAULT_CLICK_HOLD_KEYS = ["space"]
+
+PYNPUT_SPECIAL_KEYS = {
+    "up": keyboard.Key.up,
+    "down": keyboard.Key.down,
+    "left": keyboard.Key.left,
+    "right": keyboard.Key.right,
+    "space": keyboard.Key.space,
+    "kp_insert": keyboard.Key.insert,
+    "insert": keyboard.Key.insert,
+    "kp_delete": keyboard.Key.delete,
+    "delete": keyboard.Key.delete,
+}
+
+NAMED_CHAR_TOKENS = {
+    "semicolon": ";",
+    "comma": ",",
+    "period": ".",
+    "slash": "/",
+    "backslash": "\\",
+}
+
+DIRECTION_TO_KEY = {
+    "up": keyboard.Key.up,
+    "down": keyboard.Key.down,
+    "left": keyboard.Key.left,
+    "right": keyboard.Key.right,
+}
 
 class X11MouseController:
     def __init__(self, backend: X11Backend = X11Backend.XLIB, move_speed: Optional[int] = None, acceleration: Optional[float] = None):
@@ -45,7 +92,10 @@ class X11MouseController:
         self.alt_pressed = False
         self.ctrl_leap_distance = int(getattr(config, 'CTRL_LEAP_DISTANCE', 50))  # Ctrl modifier distance
         self.last_cursor_refresh = 0  # Track last cursor refresh time
-        self.space_click_active = False  # Track Space-as-left-button state
+        self.hold_click_active = False  # Track hold-as-left-button state
+        self.hold_click_refcount = 0
+        self.active_hold_keysyms = set()
+        self.active_hold_pynput_keys = set()
 
         # X11 key grabbing for suppression
         self.grabbed_keys = set()  # Track grabbed keys
@@ -76,7 +126,7 @@ class X11MouseController:
         self.smooth_movement = bool(getattr(config, 'SMOOTH_MOVEMENT', True))
         self.animation_steps = int(getattr(config, 'ANIMATION_STEPS', 2))
         self.animation_delay = float(getattr(config, 'ANIMATION_DELAY', 0.002))
-        
+
         # Throttles for expensive operations
         self.last_wake_time = 0.0
         self.animation_move_counter = 0
@@ -90,6 +140,23 @@ class X11MouseController:
 
         # Scroll settings
         self.scroll_step = int(getattr(config, 'SCROLL_STEP', 1))
+
+        # Keybinding maps
+        self.nav_bindings: Dict[str, Iterable[str]] = self._load_binding_dict('NAVIGATION_KEYS', DEFAULT_NAVIGATION_KEYS)
+        self.scroll_bindings: Dict[str, Iterable[str]] = self._load_binding_dict('SCROLL_KEYS', DEFAULT_SCROLL_KEYS)
+        self.click_bindings: Dict[str, Iterable[str]] = self._load_binding_dict('CLICK_KEYS', DEFAULT_CLICK_KEYS)
+        self.click_hold_keys: Iterable[str] = getattr(config, 'CLICK_HOLD_KEYS', DEFAULT_CLICK_HOLD_KEYS)
+
+        self.pynput_nav_map = self._build_pynput_action_map(self.nav_bindings)
+        self.pynput_scroll_map = self._build_pynput_action_map(self.scroll_bindings)
+        self.pynput_click_map = self._build_pynput_action_map(self.click_bindings)
+        self.pynput_click_hold_keys = self._build_pynput_hold_set(self.click_hold_keys)
+
+        self._keysym_cache: Dict[str, int] = {}
+        self.x_nav_keysym_map: Dict[int, str] = {}
+        self.x_scroll_keysym_map: Dict[int, str] = {}
+        self.x_click_keysym_map: Dict[int, str] = {}
+        self.x_click_hold_keysyms = set()
 
         # Environment capability detection
         self.session_type = os.environ.get('XDG_SESSION_TYPE', '').lower()
@@ -114,7 +181,7 @@ class X11MouseController:
         print(f"  Hold Alt + Ctrl: Larger steps ({self.ctrl_leap_distance}px per press)")
         print("  Hold Alt + U: Scroll up; Alt + M/N: Scroll down")
         print("  Ctrl+Q: Exit app")
-        print("  Hold Alt + H/Space: Left click (Space holds for drag); Alt + ;: Right click")
+        print("  Hold Alt + H/Space/KP_Insert: Left click (Space holds for drag); Alt + ;/KP_Delete: Right click")
         smooth_status = "ON" if self.smooth_movement else "OFF"
         print(f"\nSmooth movement: {smooth_status}")
         print("Mouse mode: Press and hold Alt to control the cursor")
@@ -127,6 +194,235 @@ class X11MouseController:
         if self.backend != X11Backend.XLIB or self.display_lock is None:
             return nullcontext()
         return self.display_lock
+
+    @staticmethod
+    def _normalize_token_list(tokens: Any, fallback: Iterable[str]) -> Iterable[str]:
+        """Coerce arbitrary token input to a clean list of strings."""
+        if tokens is None:
+            tokens = fallback
+        if isinstance(tokens, str):
+            raw = [tokens]
+        else:
+            try:
+                raw = list(tokens)
+            except TypeError:
+                raw = [tokens]
+
+        seen = set()
+        cleaned = []
+        for item in raw:
+            if item is None:
+                continue
+            text = str(item).strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(text)
+
+        if cleaned:
+            return cleaned
+        return list(fallback)
+
+    def _load_binding_dict(self, attr_name: str, fallback: Dict[str, Iterable[str]]) -> Dict[str, Iterable[str]]:
+        """Load binding dicts from config with sensible defaults."""
+        value = getattr(config, attr_name, None)
+        result: Dict[str, Iterable[str]] = {}
+
+        if isinstance(value, dict):
+            source_items = value.items()
+        else:
+            source_items = []
+
+        # Include fallback keys first to guarantee coverage
+        for action, default_tokens in fallback.items():
+            configured = None
+            if isinstance(value, dict) and action in value:
+                configured = value[action]
+            result[action] = list(self._normalize_token_list(configured, default_tokens))
+
+        # Pick up any extra user-defined actions (if any)
+        for action, tokens in source_items:
+            if action not in result:
+                result[str(action)] = list(self._normalize_token_list(tokens, []))
+
+        return result
+
+    def _token_to_pynput_key(self, token: str):
+        token = str(token).strip()
+        if not token:
+            return None
+        lower = token.lower()
+
+        if lower in PYNPUT_SPECIAL_KEYS:
+            return PYNPUT_SPECIAL_KEYS[lower]
+
+        if lower in NAMED_CHAR_TOKENS:
+            return NAMED_CHAR_TOKENS[lower]
+
+        if len(token) == 1:
+            return token.lower()
+
+        # Provide KP_- prefixed keys in lowercase fallback
+        if token.startswith('KP_') and lower in PYNPUT_SPECIAL_KEYS:
+            return PYNPUT_SPECIAL_KEYS[lower]
+
+        return None
+
+    def _build_pynput_action_map(self, bindings: Dict[str, Iterable[str]]):
+        mapping = {}
+        for action, tokens in bindings.items():
+            for token in tokens:
+                key = self._token_to_pynput_key(token)
+                if key is None:
+                    continue
+                # Last one wins in case of collision; intentional override.
+                mapping[key] = action
+        return mapping
+
+    def _build_pynput_hold_set(self, tokens: Iterable[str]):
+        result = set()
+        for token in tokens:
+            key = self._token_to_pynput_key(token)
+            if key is None:
+                continue
+            result.add(key)
+        return result
+
+    def _normalize_pynput_key(self, key):
+        if isinstance(key, keyboard.Key):
+            return key
+        try:
+            char = key.char
+        except AttributeError:
+            return None
+        if char is None:
+            return None
+        return char.lower()
+
+    def _increment_hold(self):
+        if self.hold_click_refcount == 0:
+            self.press_mouse(1)
+            self.hold_click_active = True
+        self.hold_click_refcount += 1
+
+    def _decrement_hold(self):
+        if self.hold_click_refcount == 0:
+            return
+        self.hold_click_refcount -= 1
+        if self.hold_click_refcount == 0 and self.hold_click_active:
+            self.release_mouse(1)
+            self.hold_click_active = False
+
+    def _clear_hold_state(self):
+        if self.hold_click_active:
+            self.release_mouse(1)
+        self.hold_click_active = False
+        self.hold_click_refcount = 0
+        self.active_hold_keysyms.clear()
+        self.active_hold_pynput_keys.clear()
+
+    def _activate_hold_keysym(self, keysym: int) -> bool:
+        if keysym not in self.x_click_hold_keysyms:
+            return False
+        if keysym in self.active_hold_keysyms:
+            return True
+        self.active_hold_keysyms.add(keysym)
+        self._increment_hold()
+        return True
+
+    def _deactivate_hold_keysym(self, keysym: int) -> bool:
+        if keysym not in self.active_hold_keysyms:
+            return False
+        self.active_hold_keysyms.discard(keysym)
+        self._decrement_hold()
+        return True
+
+    def _activate_hold_pynput_key(self, key) -> bool:
+        if key not in self.pynput_click_hold_keys:
+            return False
+        if key in self.active_hold_pynput_keys:
+            return True
+        self.active_hold_pynput_keys.add(key)
+        self._increment_hold()
+        return True
+
+    def _deactivate_hold_pynput_key(self, key) -> bool:
+        if key not in self.active_hold_pynput_keys:
+            return False
+        self.active_hold_pynput_keys.discard(key)
+        self._decrement_hold()
+        return True
+
+    def _token_to_keysym(self, token: str) -> Optional[int]:
+        token = str(token).strip()
+        if not token:
+            return None
+        if token in self._keysym_cache:
+            return self._keysym_cache[token]
+
+        try:
+            from Xlib import XK
+        except Exception:
+            return None
+
+        keysym = XK.string_to_keysym(token)
+        if keysym == 0:
+            lower = token.lower()
+            keysym = XK.string_to_keysym(lower)
+        if keysym == 0 and len(token) == 1:
+            keysym = ord(token)
+        if keysym == 0:
+            keysym = None
+
+        self._keysym_cache[token] = keysym
+        return keysym
+
+    def _refresh_keysym_maps(self):
+        if self.backend != X11Backend.XLIB:
+            self.x_nav_keysym_map = {}
+            self.x_scroll_keysym_map = {}
+            self.x_click_keysym_map = {}
+            self.x_click_hold_keysyms = set()
+            return
+
+        self.x_nav_keysym_map = {}
+        self.x_scroll_keysym_map = {}
+        self.x_click_keysym_map = {}
+        self.x_click_hold_keysyms = set()
+
+        for direction, tokens in self.nav_bindings.items():
+            for token in tokens:
+                keysym = self._token_to_keysym(token)
+                if keysym is not None:
+                    self.x_nav_keysym_map[keysym] = direction
+
+        for orientation, tokens in self.scroll_bindings.items():
+            for token in tokens:
+                keysym = self._token_to_keysym(token)
+                if keysym is not None:
+                    self.x_scroll_keysym_map[keysym] = orientation
+
+        for button, tokens in self.click_bindings.items():
+            for token in tokens:
+                keysym = self._token_to_keysym(token)
+                if keysym is not None:
+                    self.x_click_keysym_map[keysym] = button
+
+        for token in self.click_hold_keys:
+            keysym = self._token_to_keysym(token)
+            if keysym is not None:
+                self.x_click_hold_keysyms.add(keysym)
+
+    def _all_control_tokens(self):
+        tokens = set()
+        for collection in (self.nav_bindings, self.scroll_bindings, self.click_bindings):
+            for items in collection.values():
+                tokens.update(items)
+        tokens.update(self.click_hold_keys)
+        return tokens
 
     def _grab_alt_keys_only(self):
         """Ensure Alt toggles mouse mode without breaking desktop shortcuts."""
@@ -177,6 +473,7 @@ class X11MouseController:
                 except:
                     self.screen_width = 0
                     self.screen_height = 0
+                self._refresh_keysym_maps()
                 print("✓ Using python3-xlib backend (direct X11)")
             except ImportError as e:
                 print(f"✗ python3-xlib not available: {e}")
@@ -306,9 +603,7 @@ class X11MouseController:
             self.movement_keys.clear()
             self.scroll_keys.clear()
             self._stop_continuous_movement()
-            if self.space_click_active:
-                self.release_mouse(1)
-                self.space_click_active = False
+            self._clear_hold_state()
             self._ungrab_navigation_keys_only()
             print("\nMouse mode: OFF")
 
@@ -391,31 +686,7 @@ class X11MouseController:
         with self._display_guard():
             try:
                 from Xlib import X
-                import Xlib.XK
-
-                # Define keys to grab with their keysyms
-                navigation_keys = {
-                    # Arrow keys
-                    'Up': Xlib.XK.XK_Up,
-                    'Down': Xlib.XK.XK_Down,
-                    'Left': Xlib.XK.XK_Left,
-                    'Right': Xlib.XK.XK_Right,
-                    # IJKL keys
-                    'i': Xlib.XK.XK_i,
-                    'j': Xlib.XK.XK_j,
-                    'k': Xlib.XK.XK_k,
-                    'l': Xlib.XK.XK_l,
-                    # Scroll keys
-                    'u': Xlib.XK.XK_u,
-                    'm': Xlib.XK.XK_m,
-                    'n': Xlib.XK.XK_n,
-                    # Exit key
-                    'x': Xlib.XK.XK_x,
-                    # Click keys
-                    'h': Xlib.XK.XK_h,
-                    'semicolon': Xlib.XK.XK_semicolon,
-                    'space': Xlib.XK.XK_space
-                }
+                self._refresh_keysym_maps()
 
                 # Build comprehensive modifier combinations to account for CapsLock/NumLock/Super states
                 base_mods = [
@@ -440,21 +711,27 @@ class X11MouseController:
                             for sup in super_variants:
                                 all_modifier_combinations.add(base | caps | numl | sup)
 
+                tokens_to_grab = self._all_control_tokens()
+
                 # Suppress BadAccess errors during grabs (some combos may already be grabbed)
                 self._push_ignore_badaccess()
                 try:
-                    for key_name, keysym in navigation_keys.items():
+                    for token in tokens_to_grab:
+                        keysym = self._token_to_keysym(token)
+                        if keysym is None:
+                            continue
                         try:
                             keycode = self.display.keysym_to_keycode(keysym)
-                            if keycode != 0:
-                                for modifiers in all_modifier_combinations:
-                                    try:
-                                        self.root.grab_key(keycode, modifiers, False, X.GrabModeAsync, X.GrabModeAsync)
-                                        self.grabbed_keys.add((keycode, modifiers))
-                                    except:
-                                        pass
-                        except:
+                        except Exception:
                             continue
+                        if keycode == 0:
+                            continue
+                        for modifiers in all_modifier_combinations:
+                            try:
+                                self.root.grab_key(keycode, modifiers, False, X.GrabModeAsync, X.GrabModeAsync)
+                                self.grabbed_keys.add((keycode, modifiers))
+                            except:
+                                pass
                     self.display.sync()
                 finally:
                     self._pop_error_handler()
@@ -625,92 +902,47 @@ class X11MouseController:
                 return
 
             if event.type == X.KeyPress:
-                # Space acts as left-button hold (drag). Tap = click.
-                if keysym == Xlib.XK.XK_space:
-                    if not self.space_click_active:
-                        self.space_click_active = True
-                        self.press_mouse(1)
+                if self._activate_hold_keysym(keysym):
                     return
 
-                # Alt+U/M/N => scroll
-                if keysym == Xlib.XK.XK_u:
-                    self.scroll_keys.add('up')
-                    self._start_continuous_movement()
-                    return
-                if keysym == Xlib.XK.XK_m or keysym == Xlib.XK.XK_n:
-                    self.scroll_keys.add('down')
+                scroll_dir = self.x_scroll_keysym_map.get(keysym)
+                if scroll_dir:
+                    self.scroll_keys.add(scroll_dir)
                     self._start_continuous_movement()
                     return
 
-                # Map navigation keys to movement directions
-                if keysym == Xlib.XK.XK_Up:
-                    self.movement_keys.add(keyboard.Key.up)
-                    self._start_continuous_movement()
-                    self._move_single_step(keyboard.Key.up)
-                elif keysym == Xlib.XK.XK_Down:
-                    self.movement_keys.add(keyboard.Key.down)
-                    self._start_continuous_movement()
-                    self._move_single_step(keyboard.Key.down)
-                elif keysym == Xlib.XK.XK_Left:
-                    self.movement_keys.add(keyboard.Key.left)
-                    self._start_continuous_movement()
-                    self._move_single_step(keyboard.Key.left)
-                elif keysym == Xlib.XK.XK_Right:
-                    self.movement_keys.add(keyboard.Key.right)
-                    self._start_continuous_movement()
-                    self._move_single_step(keyboard.Key.right)
-                elif keysym == Xlib.XK.XK_i:
-                    self.movement_keys.add(keyboard.Key.up)
-                    self._start_continuous_movement()
-                    self._move_single_step(keyboard.Key.up)
-                elif keysym == Xlib.XK.XK_j:
-                    self.movement_keys.add(keyboard.Key.left)
-                    self._start_continuous_movement()
-                    self._move_single_step(keyboard.Key.left)
-                elif keysym == Xlib.XK.XK_k:
-                    self.movement_keys.add(keyboard.Key.down)
-                    self._start_continuous_movement()
-                    self._move_single_step(keyboard.Key.down)
-                elif keysym == Xlib.XK.XK_l:
-                    self.movement_keys.add(keyboard.Key.right)
-                    self._start_continuous_movement()
-                    self._move_single_step(keyboard.Key.right)
-                elif keysym == Xlib.XK.XK_space or keysym == Xlib.XK.XK_h:
+                direction = self.x_nav_keysym_map.get(keysym)
+                if direction:
+                    key_equivalent = DIRECTION_TO_KEY.get(direction)
+                    if key_equivalent is not None:
+                        if key_equivalent not in self.movement_keys:
+                            self.movement_keys.add(key_equivalent)
+                            self._start_continuous_movement()
+                        self._move_single_step(key_equivalent)
+                    return
+
+                click_button = self.x_click_keysym_map.get(keysym)
+                if click_button == 'left':
                     self.click_mouse(1)
-                elif keysym == Xlib.XK.XK_semicolon:
+                    return
+                if click_button == 'right':
                     self.click_mouse(3)
+                    return
 
             elif event.type == X.KeyRelease:
-                # Handle key releases to stop movement
-                if keysym == Xlib.XK.XK_space:
-                    if self.space_click_active:
-                        self.release_mouse(1)
-                        self.space_click_active = False
+                if self._deactivate_hold_keysym(keysym):
                     return
 
-                released = False
-                if keysym == Xlib.XK.XK_Up:
-                    released = self._release_movement_key(keyboard.Key.up)
-                elif keysym == Xlib.XK.XK_Down:
-                    released = self._release_movement_key(keyboard.Key.down)
-                elif keysym == Xlib.XK.XK_Left:
-                    released = self._release_movement_key(keyboard.Key.left)
-                elif keysym == Xlib.XK.XK_Right:
-                    released = self._release_movement_key(keyboard.Key.right)
-                elif keysym == Xlib.XK.XK_i:
-                    released = self._release_movement_key(keyboard.Key.up)
-                elif keysym == Xlib.XK.XK_j:
-                    released = self._release_movement_key(keyboard.Key.left)
-                elif keysym == Xlib.XK.XK_k:
-                    released = self._release_movement_key(keyboard.Key.down)
-                elif keysym == Xlib.XK.XK_l:
-                    released = self._release_movement_key(keyboard.Key.right)
-                elif keysym == Xlib.XK.XK_u:
-                    released = self._release_scroll_key('up')
-                elif keysym == Xlib.XK.XK_m or keysym == Xlib.XK.XK_n:
-                    released = self._release_scroll_key('down')
+                direction = self.x_nav_keysym_map.get(keysym)
+                if direction:
+                    key_equivalent = DIRECTION_TO_KEY.get(direction)
+                    if key_equivalent is not None:
+                        self._release_movement_key(key_equivalent)
+                    return
 
-                if released:
+                scroll_dir = self.x_scroll_keysym_map.get(keysym)
+                if scroll_dir:
+                    self._release_scroll_key(scroll_dir)
                     return
 
         except Exception as e:
@@ -1066,17 +1298,12 @@ class X11MouseController:
         suppress = False
         handle_locally = not self.key_grab_active
         try:
+            lookup_key = self._normalize_pynput_key(key)
+
             if key == keyboard.Key.esc:
                 # Ignore ESC to avoid accidental app exit (e.g., GNOME overview sends ESC)
                 return None
             
-            elif key == keyboard.Key.space and self.mouse_mode:
-                # Space acts as left click/hold
-                if not self.space_click_active:
-                    self.space_click_active = True
-                    self.press_mouse(1)
-                suppress = handle_locally
-                
             elif key in [keyboard.Key.ctrl_l, keyboard.Key.ctrl_r]:
                 self.ctrl_pressed = True
             
@@ -1090,57 +1317,45 @@ class X11MouseController:
                 # Allow Alt to propagate so desktop shortcuts (Alt+Tab, etc.) keep working
                 suppress = False
 
-            elif key in [keyboard.Key.up, keyboard.Key.down, 
-                        keyboard.Key.left, keyboard.Key.right]:
-                if self.mouse_mode and handle_locally:
-                    # Start continuous movement for arrow keys
-                    if key not in self.movement_keys:
-                        self.movement_keys.add(key)
-                        self._start_continuous_movement()
-                    self._move_single_step(key)
-                    suppress = True
-                
-            elif hasattr(key, 'char') and key.char:
-                raw_char = key.char
-                char = raw_char.lower()
-                # New explicit exit shortcut
+            if hasattr(key, 'char') and key.char:
+                char = key.char.lower()
                 if char == 'q' and self.ctrl_pressed:
                     print("\nExiting...")
                     self.running = False
                     return False
-                if self.mouse_mode and handle_locally:
-                    # U/M => scroll
-                    if char == 'u':
-                        self.scroll_keys.add('up')
-                        self._start_continuous_movement()
-                        suppress = True
-                        return None
-                    if char == 'm' or char == 'n':
-                        self.scroll_keys.add('down')
-                        self._start_continuous_movement()
-                        suppress = True
-                        return None
-                    # Handle IJKL navigation - continuous movement
-                    movement_map = {
-                        'i': keyboard.Key.up,    # Up
-                        'j': keyboard.Key.left,  # Left  
-                        'k': keyboard.Key.down,  # Down
-                        'l': keyboard.Key.right  # Right
-                    }
-                    
-                    if char in movement_map:
-                        key_equivalent = movement_map[char]
+
+            if self.mouse_mode and handle_locally and lookup_key is not None:
+                if self._activate_hold_pynput_key(lookup_key):
+                    suppress = True
+                    return None
+
+                direction = self.pynput_nav_map.get(lookup_key)
+                if direction:
+                    key_equivalent = DIRECTION_TO_KEY.get(direction)
+                    if key_equivalent is not None:
                         if key_equivalent not in self.movement_keys:
                             self.movement_keys.add(key_equivalent)
                             self._start_continuous_movement()
                         self._move_single_step(key_equivalent)
                         suppress = True
-                    elif char == 'h':  # Left click
-                        self.click_mouse(1)
-                        suppress = True
-                    elif char == ';':  # Right click
-                        self.click_mouse(3)
-                        suppress = True
+                    return None
+
+                scroll_dir = self.pynput_scroll_map.get(lookup_key)
+                if scroll_dir:
+                    self.scroll_keys.add(scroll_dir)
+                    self._start_continuous_movement()
+                    suppress = True
+                    return None
+
+                click_button = self.pynput_click_map.get(lookup_key)
+                if click_button == 'left':
+                    self.click_mouse(1)
+                    suppress = True
+                    return None
+                if click_button == 'right':
+                    self.click_mouse(3)
+                    suppress = True
+                    return None
 
         except AttributeError:
             pass
@@ -1155,14 +1370,11 @@ class X11MouseController:
         suppress = False
         handle_locally = not self.key_grab_active
         try:
+            lookup_key = self._normalize_pynput_key(key)
+
             if key in [keyboard.Key.ctrl_l, keyboard.Key.ctrl_r]:
                 self.ctrl_pressed = False
-            elif key == keyboard.Key.space:
-                if self.space_click_active:
-                    self.release_mouse(1)
-                    self.space_click_active = False
-                suppress = handle_locally
-                
+
             elif key in [keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r]:
                 self.shift_pressed = False
             elif key in [keyboard.Key.alt_l, keyboard.Key.alt_r]:
@@ -1170,33 +1382,22 @@ class X11MouseController:
                     self.alt_pressed = False
                     self._set_mouse_mode(False)
                 suppress = False
-                
-            elif key in [keyboard.Key.up, keyboard.Key.down, 
-                        keyboard.Key.left, keyboard.Key.right]:
-                removed = self._release_movement_key(key)
-                if removed and (self.mouse_mode or handle_locally):
-                    suppress = handle_locally
-                        
-            elif hasattr(key, 'char') and key.char:
-                char = key.char.lower()
-                # Handle IJKL key releases
-                movement_map = {
-                    'i': keyboard.Key.up,
-                    'j': keyboard.Key.left,
-                    'k': keyboard.Key.down,
-                    'l': keyboard.Key.right
-                }
 
-                if char in movement_map:
-                    removed = self._release_movement_key(movement_map[char])
-                    if removed and (self.mouse_mode or handle_locally):
-                        suppress = handle_locally
-                elif char == 'u':
-                    removed = self._release_scroll_key('up')
-                    if removed and (self.mouse_mode or handle_locally):
-                        suppress = handle_locally
-                elif char == 'm' or char == 'n':
-                    removed = self._release_scroll_key('down')
+            if lookup_key is not None:
+                if self._deactivate_hold_pynput_key(lookup_key) and handle_locally:
+                    suppress = True
+
+                direction = self.pynput_nav_map.get(lookup_key)
+                if direction:
+                    key_equivalent = DIRECTION_TO_KEY.get(direction)
+                    if key_equivalent is not None:
+                        removed = self._release_movement_key(key_equivalent)
+                        if removed and (self.mouse_mode or handle_locally):
+                            suppress = handle_locally
+
+                scroll_dir = self.pynput_scroll_map.get(lookup_key)
+                if scroll_dir:
+                    removed = self._release_scroll_key(scroll_dir)
                     if removed and (self.mouse_mode or handle_locally):
                         suppress = handle_locally
 
