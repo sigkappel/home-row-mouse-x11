@@ -92,6 +92,12 @@ class X11MouseController:
         self.alt_pressed = False
         self.active_alt_keys = set()
         self.active_alt_keysyms = set()
+        self.alt_ready = False
+        self.alt_prime_deadline = 0.0
+        self.alt_prime_timeout = 1.0
+        self.alt_suppressed = False
+        self.synthetic_alt_release_count = 0
+        self.synthetic_alt_press_count = 0
         self.ctrl_leap_distance = int(getattr(config, 'CTRL_LEAP_DISTANCE', 50))  # Ctrl modifier distance
         self.last_cursor_refresh = 0  # Track last cursor refresh time
         self.hold_click_active = False  # Track hold-as-left-button state
@@ -145,6 +151,8 @@ class X11MouseController:
 
         # External tool detection
         self.xdotool_available = self._check_xdotool()
+        self.alt_grabbed = False
+        self.alt_grabs = set()
 
         # Keybinding maps
         self.nav_bindings: Dict[str, Iterable[str]] = self._load_binding_dict('NAVIGATION_KEYS', DEFAULT_NAVIGATION_KEYS)
@@ -345,6 +353,73 @@ class X11MouseController:
                 if self.debug:
                     print(f"Failed to inject pointer event without modifiers: {exc}")
                 return False
+
+    def _is_mouse_trigger_key(self, lookup_key) -> bool:
+        return (
+            lookup_key in self.pynput_nav_map
+            or lookup_key in self.pynput_scroll_map
+            or lookup_key in self.pynput_click_map
+            or lookup_key in self.pynput_click_hold_keys
+        )
+
+    def _is_mouse_trigger_keysym(self, keysym: int) -> bool:
+        return (
+            keysym in self.x_nav_keysym_map
+            or keysym in self.x_scroll_keysym_map
+            or keysym in self.x_click_keysym_map
+            or keysym in self.x_click_hold_keysyms
+        )
+
+    def _suppress_alt_modifiers(self):
+        if self.backend != X11Backend.XLIB or self.alt_suppressed:
+            return
+        with self._display_guard():
+            try:
+                from Xlib.ext.xtest import fake_input
+                from Xlib import X, XK
+
+                for keysym in (XK.XK_Alt_L, XK.XK_Alt_R):
+                    keycode = self.display.keysym_to_keycode(keysym)
+                    if not keycode:
+                        continue
+                    try:
+                        fake_input(self.display,  X.KeyRelease, keycode)
+                        self.synthetic_alt_release_count += 1
+                    except Exception:
+                        pass
+                self.display.flush()
+                self.alt_suppressed = True
+            except Exception as exc:
+                if self.debug:
+                    print(f"Failed to suppress Alt modifiers: {exc}")
+
+    def _restore_alt_modifiers(self):
+        if self.backend != X11Backend.XLIB or not self.alt_suppressed:
+            return
+        with self._display_guard():
+            try:
+                from Xlib.ext.xtest import fake_input
+                from Xlib import X, XK
+
+                keys_to_restore = []
+                if self.alt_pressed or self.active_alt_keys or self.active_alt_keysyms:
+                    keys_to_restore = [XK.XK_Alt_L, XK.XK_Alt_R]
+
+                for keysym in keys_to_restore:
+                    keycode = self.display.keysym_to_keycode(keysym)
+                    if not keycode:
+                        continue
+                    try:
+                        fake_input(self.display, X.KeyPress, keycode)
+                        self.synthetic_alt_press_count += 1
+                    except Exception:
+                        pass
+                self.display.flush()
+            except Exception as exc:
+                if self.debug:
+                    print(f"Failed to restore Alt modifiers: {exc}")
+            finally:
+                self.alt_suppressed = False
 
     def _normalize_pynput_key(self, key):
         if isinstance(key, keyboard.Key):
@@ -621,8 +696,10 @@ class X11MouseController:
 
         self.mouse_mode = enabled
         if self.mouse_mode:
+            self._grab_alt_keys()
             self._grab_navigation_keys()
             self._sync_cached_position_from_os()
+            self._suppress_alt_modifiers()
             print("\nMouse mode: ON (Alt held)")
         else:
             self.movement_keys.clear()
@@ -630,6 +707,9 @@ class X11MouseController:
             self._stop_continuous_movement()
             self._clear_hold_state()
             self._ungrab_navigation_keys_only()
+            self._ungrab_alt_keys()
+            self._restore_alt_modifiers()
+            self.alt_ready = False
             print("\nMouse mode: OFF")
 
     def _push_ignore_badaccess(self):
@@ -800,6 +880,66 @@ class X11MouseController:
             except:
                 pass
 
+    def _grab_alt_keys(self):
+        if self.backend != X11Backend.XLIB or self.alt_grabbed:
+            return
+        with self._display_guard():
+            try:
+                from Xlib import X
+                import Xlib.XK
+
+                caps_variants = [0, X.LockMask]
+                numlock_variants = [0, X.Mod2Mask]
+                super_variants = [0, X.Mod4Mask]
+
+                self._push_ignore_badaccess()
+                try:
+                    for keysym in (Xlib.XK.XK_Alt_L, Xlib.XK.XK_Alt_R):
+                        keycode = self.display.keysym_to_keycode(keysym)
+                        if keycode == 0:
+                            continue
+                        for caps in caps_variants:
+                            for numl in numlock_variants:
+                                for sup in super_variants:
+                                    modifiers = caps | numl | sup
+                                    try:
+                                        self.root.grab_key(keycode, modifiers, True, X.GrabModeAsync, X.GrabModeAsync)
+                                        self.alt_grabs.add((keycode, modifiers))
+                                    except:
+                                        pass
+                    self.display.flush()
+                finally:
+                    self._pop_error_handler()
+
+                self.alt_grabbed = True
+            except Exception as exc:
+                if self.debug:
+                    print(f"Alt grab failed: {exc}")
+
+    def _ungrab_alt_keys(self):
+        if self.backend != X11Backend.XLIB or not self.alt_grabbed:
+            return
+        with self._display_guard():
+            try:
+                from Xlib import X
+
+                self._push_ignore_badaccess()
+                try:
+                    for keycode, modifiers in list(self.alt_grabs):
+                        try:
+                            self.root.ungrab_key(keycode, modifiers)
+                        except:
+                            pass
+                    self.alt_grabs.clear()
+                    self.display.flush()
+                finally:
+                    self._pop_error_handler()
+
+                self.alt_grabbed = False
+            except Exception as exc:
+                if self.debug:
+                    print(f"Alt ungrab failed: {exc}")
+
     def _ungrab_navigation_keys(self):
         """Release grabbed navigation keys"""
         if self.backend != X11Backend.XLIB or not self.grabbed_keys:
@@ -901,6 +1041,14 @@ class X11MouseController:
                 print(f"DEBUG: Grabbed {event_type} for key: {key_name}")
 
             if event.type == X.KeyPress and keysym in (Xlib.XK.XK_Alt_L, Xlib.XK.XK_Alt_R):
+                if self.synthetic_alt_press_count > 0:
+                    self.synthetic_alt_press_count -= 1
+                    return
+                now = time.time()
+                if now <= self.alt_prime_deadline:
+                    self.alt_ready = True
+                else:
+                    self.alt_ready = False
                 self.active_alt_keysyms.add(keysym)
                 if keysym == Xlib.XK.XK_Alt_L:
                     self.active_alt_keys.add(keyboard.Key.alt_l)
@@ -908,10 +1056,12 @@ class X11MouseController:
                     self.active_alt_keys.add(keyboard.Key.alt_r)
                 if not self.alt_pressed:
                     self.alt_pressed = True
-                    self._set_mouse_mode(True)
                 return
 
             if event.type == X.KeyRelease and keysym in (Xlib.XK.XK_Alt_L, Xlib.XK.XK_Alt_R):
+                if self.synthetic_alt_release_count > 0:
+                    self.synthetic_alt_release_count -= 1
+                    return
                 if keysym in self.active_alt_keysyms:
                     self.active_alt_keysyms.discard(keysym)
                 if keysym == Xlib.XK.XK_Alt_L:
@@ -920,11 +1070,18 @@ class X11MouseController:
                     self.active_alt_keys.discard(keyboard.Key.alt_r)
                 if not self.active_alt_keys and not self.active_alt_keysyms and self.alt_pressed:
                     self.alt_pressed = False
-                    self._set_mouse_mode(False)
+                    if self.mouse_mode:
+                        self._set_mouse_mode(False)
+                self.alt_prime_deadline = time.time() + self.alt_prime_timeout
+                self.alt_ready = False
                 return
 
             if not self.mouse_mode:
-                return
+                if self.alt_pressed and self.alt_ready and self._is_mouse_trigger_keysym(keysym):
+                    self._set_mouse_mode(True)
+                    self.alt_ready = False
+                else:
+                    return
 
             if event.type == X.KeyPress:
                 if self._activate_hold_keysym(keysym):
@@ -1352,11 +1509,19 @@ class X11MouseController:
                 self.shift_pressed = True
 
             elif key in [keyboard.Key.alt_l, keyboard.Key.alt_r]:
+                if self.synthetic_alt_press_count > 0:
+                    self.synthetic_alt_press_count -= 1
+                    suppress = True
+                    return None
+                now = time.time()
+                if now <= self.alt_prime_deadline:
+                    self.alt_ready = True
+                else:
+                    self.alt_ready = False
                 if key not in self.active_alt_keys:
                     self.active_alt_keys.add(key)
                 if not self.alt_pressed:
                     self.alt_pressed = True
-                    self._set_mouse_mode(True)
                 suppress = True
 
             if hasattr(key, 'char') and key.char:
@@ -1365,6 +1530,11 @@ class X11MouseController:
                     print("\nExiting...")
                     self.running = False
                     return False
+
+            if (not self.mouse_mode and self.alt_pressed and self.alt_ready
+                    and lookup_key is not None and self._is_mouse_trigger_key(lookup_key)):
+                self._set_mouse_mode(True)
+                self.alt_ready = False
 
             if self.mouse_mode and handle_locally and lookup_key is not None:
                 if self._activate_hold_pynput_key(lookup_key):
@@ -1420,11 +1590,18 @@ class X11MouseController:
             elif key in [keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r]:
                 self.shift_pressed = False
             elif key in [keyboard.Key.alt_l, keyboard.Key.alt_r]:
+                if self.synthetic_alt_release_count > 0:
+                    self.synthetic_alt_release_count -= 1
+                    suppress = True
+                    return None
                 if key in self.active_alt_keys:
                     self.active_alt_keys.discard(key)
                 if not self.active_alt_keys and not self.active_alt_keysyms and self.alt_pressed:
                     self.alt_pressed = False
-                    self._set_mouse_mode(False)
+                    if self.mouse_mode:
+                        self._set_mouse_mode(False)
+                self.alt_prime_deadline = time.time() + self.alt_prime_timeout
+                self.alt_ready = False
                 suppress = True
             if lookup_key is not None:
                 if self._deactivate_hold_pynput_key(lookup_key) and handle_locally:

@@ -4,11 +4,11 @@ Control your X11 pointer from the home row. Hold the left `Alt` key to enter mou
 
 ## Features
 
-- **Alt-held mouse mode**: Press and hold the left `Alt` key to capture movement and click bindings; release `Alt` to give keyboard control back to the desktop.
+- **Alt-held mouse mode with priming**: Tap `Alt`, release, then press and hold `Alt` within one second; the next navigation/click key engages mouse mode. Release `Alt` to exit.
 - **Home-row navigation**: `I/J/K/L` (or the arrow keys) move the cursor; holding `Ctrl` increases the step size.
 - **Scrolling**: `U` scrolls up, `M` or `N` scroll down. Scroll repeats while keys are held.
 - **Clicks & drags**: `H` taps left click, `Space` presses and holds the left button (drag), `;` performs a right click.
-- **No Alt+click surprises**: When Alt is held, clicks are emitted without the modifier so browsers (e.g. Chrome) follow links instead of downloading them.
+- **No Alt+click surprises**: When Alt is held, the controller swallows Alt and sends modifier-free clicks so browsers (e.g. Chrome) follow links instead of downloading them.
 - **Smooth, fast motion**: High-frequency update loop with optional interpolation; default `xlib` backend avoids Python subprocess overhead.
 - **Backend fallbacks**: Choose `xdotool` or `xinput` explicitly for compatibility testing.
 
@@ -39,7 +39,7 @@ python3 hrm.py xinput   # low-level device control
 
 ### Controls
 
-- **Enter mouse mode**: Hold `Alt`.
+- **Prime + enter mouse mode**: Tap `Alt`, release, then press and hold `Alt` again within one second. While holding `Alt`, press any movement/click key to enable mouse mode (wait too long and you’ll need to re-prime with another quick tap).
 - **Move**: `I/J/K/L` or arrow keys (Alt must be held). Hold `Ctrl` for larger steps.
 - **Scroll**: Alt+`U` scroll up; Alt+`M`/`N` scroll down.
 - **Left click**: Alt+`H`. Alt+`Space` holds the left button for dragging; release `Space` to drop.
